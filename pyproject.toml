@@ -1,7 +1,18 @@
 [project]
 name = "vista-rpms-archive"
 version = "0.1.0"
-description = "Add your description here"
+description = "Document extraction pipeline for Vista RPMS Archive - extracts office documents to markdown"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "docling>=2.0.0",
+    "google-cloud-storage>=2.0.0",
+    "qdrant-client[fastembed]>=1.12.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

@@ -23,9 +23,9 @@
 
 **Purpose**: Project initialization and basic structure
 
-- [ ] T001 Create project directory structure: `src/`, `tests/unit/`, `tests/integration/`
-- [ ] T002 Initialize Python project with pyproject.toml (uv, Python 3.11+, dependencies: docling, google-cloud-storage, tomli)
-- [ ] T003 [P] Create config.example.toml with all configuration options documented
+- [X] T001 Create project directory structure: `src/`, `tests/unit/`, `tests/integration/`
+- [X] T002 Initialize Python project with pyproject.toml (uv, Python 3.11+, dependencies: docling, google-cloud-storage, tomli)
+- [X] T003 [P] Create config.example.toml with all configuration options documented
 
 ---
 
@@ -35,15 +35,15 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T004 Create data classes for IndexEntry and ArchiveEntry in src/types.py
-- [ ] T005 [P] Create data classes for ExtractionResult, Config, ProcessingSummary in src/types.py
-- [ ] T006 [P] Create GCS client wrapper with connection pooling in src/gcs_client.py
-- [ ] T007 Implement blob.exists() cache check method in src/gcs_client.py
-- [ ] T008 [P] Implement download_to_temp() method in src/gcs_client.py
-- [ ] T009 [P] Implement upload_markdown() method in src/gcs_client.py
-- [ ] T010 Create TOML config loader in src/config.py
-- [ ] T011 Add CLI argument parsing with config file override in src/config.py
-- [ ] T012 Create MIME type filter constants (OFFICE_MIME_TYPES, ARCHIVE_MIME_TYPES) in src/types.py. Note: OFFICE_MIME_TYPES includes RTF; ARCHIVE_MIME_TYPES must EXCLUDE office MIME types (DOCX/XLSX/PPTX are ZIP-based but are NOT archives)
+- [X] T004 Create data classes for IndexEntry and ArchiveEntry in src/types.py
+- [X] T005 [P] Create data classes for ExtractionResult, Config, ProcessingSummary in src/types.py
+- [X] T006 [P] Create GCS client wrapper with connection pooling in src/gcs_client.py
+- [X] T007 Implement blob.exists() cache check method in src/gcs_client.py
+- [X] T008 [P] Implement download_to_temp() method in src/gcs_client.py
+- [X] T009 [P] Implement upload_markdown() method in src/gcs_client.py
+- [X] T010 Create TOML config loader in src/config.py
+- [X] T011 Add CLI argument parsing with config file override in src/config.py
+- [X] T012 Create MIME type filter constants (OFFICE_MIME_TYPES, ARCHIVE_MIME_TYPES) in src/types.py. Note: OFFICE_MIME_TYPES includes RTF; ARCHIVE_MIME_TYPES must EXCLUDE office MIME types (DOCX/XLSX/PPTX are ZIP-based but are NOT archives)
 
 **Checkpoint**: Foundation ready - user story implementation can now begin
 
@@ -57,15 +57,15 @@
 
 ### Implementation for User Story 1
 
-- [ ] T013 [US1] Create index loader to read and parse index.json from GCS in src/index_loader.py
-- [ ] T014 [US1] Implement MIME type filter for office documents in src/index_loader.py
-- [ ] T015 [US1] Create docling extractor wrapper with PdfPipelineOptions(do_ocr=False) in src/extractor.py
-- [ ] T016 [US1] Configure ImageRefMode.PLACEHOLDER for markdown export in src/extractor.py
-- [ ] T017 [US1] Implement extract_to_markdown(file_path) -> str method in src/extractor.py
-- [ ] T018 [US1] Create single-file processing function (download -> extract -> upload) in src/pipeline.py
-- [ ] T019 [US1] Create CLI entry point with basic run mode in extract.py
-- [ ] T020 [US1] Add progress logging (files processed, remaining) in src/pipeline.py
-- [ ] T021 [US1] Add error logging to extraction_errors.log in src/pipeline.py
+- [X] T013 [US1] Create index loader to read and parse index.json from GCS in src/index_loader.py
+- [X] T014 [US1] Implement MIME type filter for office documents in src/index_loader.py
+- [X] T015 [US1] Create docling extractor wrapper with PdfPipelineOptions(do_ocr=False) in src/extractor.py
+- [X] T016 [US1] Configure ImageRefMode.PLACEHOLDER for markdown export in src/extractor.py
+- [X] T017 [US1] Implement extract_to_markdown(file_path) -> str method in src/extractor.py
+- [X] T018 [US1] Create single-file processing function (download -> extract -> upload) in src/pipeline.py
+- [X] T019 [US1] Create CLI entry point with basic run mode in extract.py
+- [X] T020 [US1] Add progress logging (files processed, remaining) in src/pipeline.py
+- [X] T021 [US1] Add error logging to extraction_errors.log in src/pipeline.py
 
 **Checkpoint**: At this point, User Story 1 should be fully functional - can extract office documents to markdown
 
@@ -79,10 +79,10 @@
 
 ### Implementation for User Story 2
 
-- [ ] T022 [US2] Add cache_path_for_source() helper to compute cache paths in src/gcs_client.py
-- [ ] T023 [US2] Implement cache existence check before processing in src/pipeline.py
-- [ ] T024 [US2] Add "skipped (cached)" logging for cached files in src/pipeline.py
-- [ ] T025 [US2] Update progress to show "X to process, Y cached" in src/pipeline.py
+- [X] T022 [US2] Add cache_path_for_source() helper to compute cache paths in src/gcs_client.py
+- [X] T023 [US2] Implement cache existence check before processing in src/pipeline.py
+- [X] T024 [US2] Add "skipped (cached)" logging for cached files in src/pipeline.py
+- [X] T025 [US2] Update progress to show "X to process, Y cached" in src/pipeline.py
 
 **Checkpoint**: Re-running extraction skips already-cached files
 
@@ -96,9 +96,9 @@
 
 ### Implementation for User Story 3
 
-- [ ] T026 [US3] Implement is_office_document(mime_type) filter in src/index_loader.py
-- [ ] T027 [US3] Filter index entries by MIME type before processing in src/pipeline.py
-- [ ] T028 [US3] Add filtered count to progress output ("Found X files, Y office documents") in src/pipeline.py
+- [X] T026 [US3] Implement is_office_document(mime_type) filter in src/index_loader.py
+- [X] T027 [US3] Filter index entries by MIME type before processing in src/pipeline.py
+- [X] T028 [US3] Add filtered count to progress output ("Found X files, Y office documents") in src/pipeline.py
 
 **Checkpoint**: Only office documents are processed, other file types ignored
 
@@ -112,11 +112,11 @@
 
 ### Implementation for User Story 5
 
-- [ ] T029 [US5] Create ProgressTracker class with thread-safe counters in src/pipeline.py
-- [ ] T030 [US5] Implement ThreadPoolExecutor with configurable worker count in src/pipeline.py
-- [ ] T031 [US5] Add max_pending backpressure to control memory in src/pipeline.py
-- [ ] T032 [US5] Implement per-task error isolation (try/except per future) in src/pipeline.py
-- [ ] T033 [US5] Add concurrent progress reporting in src/pipeline.py
+- [X] T029 [US5] Create ProgressTracker class with thread-safe counters in src/pipeline.py
+- [X] T030 [US5] Implement ThreadPoolExecutor with configurable worker count in src/pipeline.py
+- [X] T031 [US5] Add max_pending backpressure to control memory in src/pipeline.py
+- [X] T032 [US5] Implement per-task error isolation (try/except per future) in src/pipeline.py
+- [X] T033 [US5] Add concurrent progress reporting in src/pipeline.py
 
 **Checkpoint**: Parallel processing works, errors isolated per file
 
@@ -130,12 +130,12 @@
 
 ### Implementation for User Story 4
 
-- [ ] T034 [US4] Implement is_archive(mime_type) check in src/index_loader.py. Must return False for ZIP-based office formats (DOCX, XLSX, PPTX) even though they are technically ZIP files
-- [ ] T035 [US4] Add extension-based filter for files within archives (from index.json archive_contents) in src/index_loader.py
-- [ ] T036 [US4] Skip archives with no office documents based on index.json in src/pipeline.py
-- [ ] T037 [US4] Implement archive download and extraction to temp directory in src/pipeline.py
-- [ ] T038 [US4] Process extracted files and upload markdown with archive path prefix in src/pipeline.py
-- [ ] T039 [US4] Clean up temp files after archive processing in src/pipeline.py
+- [X] T034 [US4] Implement is_archive(mime_type) check in src/index_loader.py. Must return False for ZIP-based office formats (DOCX, XLSX, PPTX) even though they are technically ZIP files
+- [X] T035 [US4] Add extension-based filter for files within archives (from index.json archive_contents) in src/index_loader.py
+- [X] T036 [US4] Skip archives with no office documents based on index.json in src/pipeline.py
+- [X] T037 [US4] Implement archive download and extraction to temp directory in src/pipeline.py
+- [X] T038 [US4] Process extracted files and upload markdown with archive path prefix in src/pipeline.py
+- [X] T039 [US4] Clean up temp files after archive processing in src/pipeline.py
 
 **Checkpoint**: Archives with office documents are processed, empty archives skipped
 
@@ -149,10 +149,10 @@
 
 ### Implementation for User Story 6
 
-- [ ] T040 [US6] Add --config flag to CLI argument parser in extract.py
-- [ ] T041 [US6] Implement config file loading with tomli in src/config.py
-- [ ] T042 [US6] Merge CLI args over config file values (CLI takes precedence) in src/config.py
-- [ ] T043 [US6] Add config validation with clear error messages in src/config.py
+- [X] T040 [US6] Add --config flag to CLI argument parser in extract.py
+- [X] T041 [US6] Implement config file loading with tomli in src/config.py
+- [X] T042 [US6] Merge CLI args over config file values (CLI takes precedence) in src/config.py
+- [X] T043 [US6] Add config validation with clear error messages in src/config.py
 
 **Checkpoint**: Configuration works via file or CLI
 
@@ -162,11 +162,11 @@
 
 **Purpose**: Stub for future Qdrant loading + final polish
 
-- [ ] T044 [P] Create Qdrant stub functions in src/qdrant_stub.py (load_document, create_collection - not implemented)
-- [ ] T045 [P] Add --dry-run flag to show what would be processed without processing in extract.py
-- [ ] T046 Add --stats-only flag to show cache coverage statistics in extract.py
-- [ ] T047 Add ProcessingSummary output at end of run in src/pipeline.py
-- [ ] T048 Run quickstart.md validation - verify all documented commands work
+- [X] T044 [P] Create Qdrant stub functions in src/qdrant_stub.py (load_document, create_collection - not implemented)
+- [X] T045 [P] Add --dry-run flag to show what would be processed without processing in extract.py
+- [X] T046 Add --stats-only flag to show cache coverage statistics in extract.py
+- [X] T047 Add ProcessingSummary output at end of run in src/pipeline.py
+- [X] T048 Run quickstart.md validation - verify all documented commands work
 
 ---
 

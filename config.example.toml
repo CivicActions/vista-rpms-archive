@@ -1,0 +1,40 @@
+# Document Extraction Pipeline Configuration
+# Copy this file to config.toml and customize for your environment
+
+[gcs]
+# GCS bucket containing source files and index.json
+source_bucket = "my-archive-bucket"
+# Prefix path within source bucket (empty string for root)
+source_prefix = "data/"
+
+# GCS bucket for cached markdown output (can be same as source)
+cache_bucket = "my-archive-bucket"
+# Prefix path for cached files (separate from source)
+cache_prefix = "cache/"
+
+[processing]
+# Number of parallel workers (default: CPU count)
+workers = 8
+# Maximum concurrent tasks to limit memory usage
+max_pending = 20
+# Per-file processing timeout in seconds
+timeout = 120
+
+[extraction]
+# Maximum pages to extract per document (0 = unlimited)
+max_pages = 500
+# Maximum file size to process in bytes (50MB default)
+max_file_size = 52428800
+
+[logging]
+# Log level: DEBUG, INFO, WARNING, ERROR
+level = "INFO"
+# Error log file path
+error_file = "extraction_errors.log"
+
+[qdrant]
+# Stub configuration for future Qdrant integration
+# These settings are not used in the current implementation
+host = "localhost"
+port = 6333
+collection = "documents"

@@ -95,9 +95,17 @@ Failed files are logged to `extraction_errors.log`:
 
 ### Re-process Failed Files
 
+To re-process failed files, extract their paths from the error log and use the `--prefix` option to target specific directories, or manually remove them from the cache and re-run:
+
 ```bash
-# Extract file paths from error log and reprocess
-grep "FAILED" extraction_errors.log | cut -d'|' -f3 | xargs python extract.py --files
+# Find failed files
+grep "FAILED" extraction_errors.log | cut -d'|' -f3
+
+# Re-run against specific directory containing failures
+python extract.py --config config.toml --prefix data/reports/2025/
+
+# Or remove cached entries and re-run (clears all cache, use with caution)
+# gsutil rm -r gs://<bucket>/<cache_prefix>/
 ```
 
 ### Check Cache Coverage
@@ -112,6 +120,13 @@ python extract.py --config config.toml --stats-only
 ```bash
 # Only process files under a specific prefix
 python extract.py --config config.toml --prefix data/reports/2025/
+```
+
+### Skip Archive Processing
+
+```bash
+# Only process top-level files, skip archives
+python extract.py --config config.toml --no-archives
 ```
 
 ## Troubleshooting
