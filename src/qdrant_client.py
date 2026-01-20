@@ -125,8 +125,10 @@ class QdrantIndexer:
         try:
             client = QdrantClient(
                 url=self.config.url,
+                port=None,  # Don't append default port - URL includes port or uses standard HTTPS 443
                 api_key=self.config.api_key if self.config.api_key else None,
-                timeout=30,
+                timeout=120,  # Increased timeout for slow connections
+                prefer_grpc=False,  # Use HTTP for better firewall compatibility
             )
             # Test connection
             client.get_collections()
