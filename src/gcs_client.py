@@ -148,6 +148,24 @@ class GCSClient:
         )
         logger.debug(f"Uploaded markdown to {cache_path}")
     
+    def read_cached_markdown(self, cache_path: str) -> str:
+        """Read cached markdown content from GCS.
+        
+        Args:
+            cache_path: Cache path (without bucket name)
+        
+        Returns:
+            Markdown content as string
+        
+        Raises:
+            NotFound: If cached file doesn't exist
+            GoogleCloudError: For other GCS errors
+        """
+        blob = self._cache_bucket.blob(cache_path)
+        content = blob.download_as_text()
+        logger.debug(f"Read cached markdown from {cache_path}")
+        return content
+    
     def download_index_json(self) -> dict:
         """Download and parse index.json from source bucket root.
         

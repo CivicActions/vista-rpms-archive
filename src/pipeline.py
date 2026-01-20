@@ -229,12 +229,29 @@ class Pipeline:
         start_time = time.time()
         source_path = entry.path
         
-        # Check cache first (skip if force flag is set)
+        # Check cache first (skip extraction if already cached and not forcing)
+        cache_path = self.gcs_client.cache_path_for_source(source_path)
         if not self.config.force and self.gcs_client.cache_exists(source_path):
-            logger.debug(f"Skipped (cached): {source_path}")
+            # File is cached - still need to index if not already indexed
+            if self.enable_indexing and self.indexer is not None:
+                try:
+                    # Read cached content for indexing
+                    markdown_content = self.gcs_client.read_cached_markdown(cache_path)
+                    original_format = entry.extension or Path(source_path).suffix
+                    self._index_document(
+                        source_path=source_path,
+                        cache_path=cache_path,
+                        markdown_content=markdown_content,
+                        file_size=entry.size_bytes,
+                        original_format=original_format,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to index cached file {source_path}: {e}")
+            
+            logger.debug(f"Skipped extraction (cached): {source_path}")
             return ExtractionResult(
                 source_path=source_path,
-                cache_path=self.gcs_client.cache_path_for_source(source_path),
+                cache_path=cache_path,
                 success=True,
                 skipped=True,
                 processing_time_ms=int((time.time() - start_time) * 1000),
@@ -341,11 +358,34 @@ class Pipeline:
                     # Build cache path: <cache_prefix>/<archive_path>/<inner_path>.md
                     cache_path = f"{self.config.cache_prefix}{archive_path}/{inner_path}.md"
                     
-                    # Check if already cached (skip if force flag is set)
+                    # Check if already cached (skip extraction if not forcing)
                     if not self.config.force and self.gcs_client.cache_exists_by_path(cache_path):
-                        logger.debug(f"Skipped (cached): {archive_path}/{inner_path}")
+                        # File is cached - still need to index if not already indexed
+                        source_full_path = f"{archive_path}/{inner_path}"
+                        if self.enable_indexing and self.indexer is not None:
+                            try:
+                                markdown_content = self.gcs_client.read_cached_markdown(cache_path)
+                                original_format = Path(inner_path).suffix
+                                # Get file size from archive entry if available
+                                file_size = 0
+                                if entry.archive_contents:
+                                    for ae in entry.archive_contents:
+                                        if ae.name == inner_path:
+                                            file_size = ae.size
+                                            break
+                                self._index_document(
+                                    source_path=source_full_path,
+                                    cache_path=cache_path,
+                                    markdown_content=markdown_content,
+                                    file_size=file_size,
+                                    original_format=original_format,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to index cached file {source_full_path}: {e}")
+                        
+                        logger.debug(f"Skipped extraction (cached): {archive_path}/{inner_path}")
                         results.append(ExtractionResult(
-                            source_path=f"{archive_path}/{inner_path}",
+                            source_path=source_full_path,
                             cache_path=cache_path,
                             success=True,
                             skipped=True,
