@@ -3,7 +3,7 @@
 import logging
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError, NotFound
@@ -45,7 +45,7 @@ class GCSClient:
         """Compute the cache path for a source file.
         
         Args:
-            source_path: Relative path of source file (from index.json)
+            source_path: Relative path of source file (without bucket)
         
         Returns:
             Full GCS path for cached markdown file
@@ -58,6 +58,88 @@ class GCSClient:
         
         # Add .md extension and cache prefix
         return f"{self._cache_prefix}{relative_path}.md"
+    
+    def list_blobs(
+        self,
+        prefix: Optional[str] = None,
+    ) -> Iterator[storage.Blob]:
+        """Iterate over all blobs in source bucket.
+        
+        Supports the new GCS-first architecture where we iterate over all
+        files directly rather than relying on an index.json manifest.
+        
+        Args:
+            prefix: Optional prefix to filter blobs. If None, uses the
+                    source_prefix configured at init time.
+        
+        Yields:
+            storage.Blob objects for each file in the bucket.
+        """
+        effective_prefix = prefix if prefix is not None else self._source_prefix
+        # Remove trailing slash for listing if present, as GCS handles it
+        if effective_prefix and effective_prefix.endswith('/'):
+            effective_prefix = effective_prefix[:-1]
+        
+        logger.info(f"Listing blobs in gs://{self._source_bucket_name}/{effective_prefix or ''}")
+        yield from self._source_bucket.list_blobs(prefix=effective_prefix or None)
+    
+    def download_blob_content(self, blob: storage.Blob) -> bytes:
+        """Download blob content as bytes without creating a temp file.
+        
+        Useful for classification and direct text processing.
+        
+        Args:
+            blob: GCS Blob object to download.
+        
+        Returns:
+            Raw file content as bytes.
+        
+        Raises:
+            GoogleCloudError: If download fails.
+        """
+        try:
+            content = blob.download_as_bytes()
+            logger.debug(f"Downloaded {blob.name} ({len(content)} bytes)")
+            return content
+        except GoogleCloudError as e:
+            logger.error(f"Failed to download blob {blob.name}: {e}")
+            raise
+    
+    def download_blob_to_temp(self, blob: storage.Blob) -> Path:
+        """Download a blob to a temporary file.
+        
+        Similar to download_to_temp but takes a Blob object directly.
+        
+        Args:
+            blob: GCS Blob object to download.
+        
+        Returns:
+            Path to temporary file (caller must delete after use).
+        
+        Raises:
+            GoogleCloudError: If download fails.
+        """
+        # Determine suffix from blob name
+        suffix = None
+        if "." in blob.name:
+            suffix = "." + blob.name.rsplit(".", 1)[-1]
+        
+        temp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+            prefix="gcs_blob_"
+        )
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+        
+        try:
+            blob.download_to_filename(str(temp_path))
+            logger.debug(f"Downloaded {blob.name} to {temp_path}")
+            return temp_path
+        except Exception:
+            # Clean up temp file on error
+            temp_path.unlink(missing_ok=True)
+            raise
     
     def cache_exists(self, source_path: str) -> bool:
         """Check if cached markdown exists for a source file.

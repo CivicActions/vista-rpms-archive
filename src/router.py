@@ -88,6 +88,36 @@ class Router:
         # Default: case-insensitive substring match
         return pattern.lower() in path.lower()
     
+    def route_with_category(
+        self,
+        source_path: str,
+        is_source_code: bool = False,
+    ) -> str:
+        """Route document with optional source code category handling.
+        
+        Source code files are routed to *-source collections instead of
+        the main documentation collections.
+        
+        Args:
+            source_path: GCS source path of the document.
+            is_source_code: If True, route to source collection variant.
+        
+        Returns:
+            Name of the target Qdrant collection.
+        """
+        # Get base collection from normal routing
+        base_collection = self.route(source_path)
+        
+        # If source code, append "-source" suffix
+        if is_source_code:
+            source_collection = f"{base_collection}-source"
+            logger.debug(
+                f"Source code '{source_path}' -> '{source_collection}'"
+            )
+            return source_collection
+        
+        return base_collection
+    
     @classmethod
     def from_config(
         cls,

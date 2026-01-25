@@ -127,7 +127,7 @@ class QdrantIndexer:
                 url=self.config.url,
                 port=None,  # Don't append default port - URL includes port or uses standard HTTPS 443
                 api_key=self.config.api_key if self.config.api_key else None,
-                timeout=120,  # Increased timeout for slow connections
+                timeout=600,  # 10 minute timeout for large document uploads
                 prefer_grpc=False,  # Use HTTP for better firewall compatibility
             )
             # Test connection
@@ -227,6 +227,87 @@ class QdrantIndexer:
             # Collection or point doesn't exist
             return False
     
+    def exists_by_path(
+        self,
+        source_path: str,
+        collection_name: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Check if document exists by source path (without content hash comparison).
+        
+        Used for skip detection in the GCS-first pipeline architecture where
+        we want to skip files that have already been indexed, regardless of
+        whether the content has changed.
+        
+        Args:
+            source_path: GCS source path of the document.
+            collection_name: Optional specific collection to check. If None,
+                           checks all collections.
+        
+        Returns:
+            Tuple of (exists: bool, collection_name: str or None).
+            If exists is True, collection_name contains the collection where found.
+        """
+        point_id = get_point_id(source_path)
+        
+        # If specific collection provided, check only that one
+        if collection_name:
+            try:
+                points = self.client.retrieve(
+                    collection_name=collection_name,
+                    ids=[point_id],
+                    with_payload=False,
+                )
+                if points:
+                    logger.debug(f"Document '{source_path}' exists in '{collection_name}'")
+                    return True, collection_name
+            except UnexpectedResponse:
+                pass
+            return False, None
+        
+        # Check all known collections
+        collections_to_check = self._get_all_collections()
+        
+        for coll in collections_to_check:
+            try:
+                points = self.client.retrieve(
+                    collection_name=coll,
+                    ids=[point_id],
+                    with_payload=False,
+                )
+                if points:
+                    logger.debug(f"Document '{source_path}' exists in '{coll}'")
+                    return True, coll
+            except UnexpectedResponse:
+                # Collection doesn't exist or point not found
+                continue
+        
+        logger.debug(f"Document '{source_path}' not found in any collection")
+        return False, None
+    
+    def _get_all_collections(self) -> list[str]:
+        """Get list of all collection names to check for existence.
+        
+        Returns collections based on routing configuration plus defaults.
+        
+        Returns:
+            List of collection names.
+        """
+        # Start with unique collections from routing rules
+        collections = set()
+        for rule in self.router.rules:
+            collections.add(rule.collection)
+        
+        # Add default collection
+        collections.add(self.router.default_collection)
+        
+        # Add source variants if base collections exist
+        base_collections = list(collections)
+        for base in base_collections:
+            if not base.endswith("-source"):
+                collections.add(f"{base}-source")
+        
+        return list(collections)
+    
     def index_document(
         self,
         source_path: str,
@@ -236,6 +317,7 @@ class QdrantIndexer:
         original_format: str,
         dry_run: bool = False,
         force: bool = False,
+        is_source_code: bool = False,
     ) -> IndexingResult:
         """Index a document into Qdrant.
         
@@ -249,12 +331,13 @@ class QdrantIndexer:
             original_format: Original file extension (.pdf, .html, etc.).
             dry_run: If True, check if indexing would happen but don't write.
             force: If True, skip the duplicate check and always re-index.
+            is_source_code: If True, route to source collection variant.
         
         Returns:
             IndexingResult with status and any error message.
         """
-        # Determine target collection
-        collection_name = self.router.route(source_path)
+        # Determine target collection (with source code awareness)
+        collection_name = self.router.route_with_category(source_path, is_source_code)
         
         # Ensure collection exists (unless dry_run)
         if not dry_run:

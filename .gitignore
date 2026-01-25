@@ -58,4 +58,9 @@ Thumbs.db
 # Temporary files
 *.tmp
 temp/
+
+# Config files (contain credentials)
+config.toml
 *.json
+!package.json
+!package-lock.json

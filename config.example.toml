@@ -1,8 +1,11 @@
-# Document Extraction Pipeline Configuration
+# GCS-first Document Processing Pipeline Configuration
 # Copy this file to config.toml and customize for your environment
+#
+# This pipeline iterates directly over GCS bucket contents and indexes
+# to Qdrant. No local index.json or SQLite tracking required.
 
 [gcs]
-# GCS bucket containing source files and index.json
+# GCS bucket containing source files
 source_bucket = "my-archive-bucket"
 # Prefix path within source bucket (empty string for root)
 source_prefix = "data/"
@@ -33,8 +36,22 @@ level = "INFO"
 error_file = "extraction_errors.log"
 
 [qdrant]
-# Stub configuration for future Qdrant integration
-# These settings are not used in the current implementation
-host = "localhost"
-port = 6333
-collection = "documents"
+# Qdrant server URL (can be overridden with QDRANT_URL env var)
+url = "http://localhost:6333"
+# API key for authentication (can be overridden with QDRANT_API_KEY env var)
+api_key = ""
+# Default collection for documents (when no routing rules match)
+default_collection = "vista"
+# Embedding model to use
+embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Routing rules - documents are routed to collections based on path patterns
+# Rules are evaluated in order; first match wins
+# Pattern can be a simple substring or regex (use ^ or $ for regex mode)
+[[qdrant.routing]]
+pattern = "rpms"
+collection = "rpms"
+
+[[qdrant.routing]]
+pattern = "vista"
+collection = "vista"
