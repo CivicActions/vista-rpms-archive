@@ -48,6 +48,7 @@ htmlcov/
 *.env
 
 # Logs
+logs/
 *.log
 extraction_errors.log
 

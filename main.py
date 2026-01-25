@@ -15,19 +15,12 @@ Usage:
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from src.config import load_config_file, merge_config, validate_config
+from src.logging_config import setup_logging
 from src.pipeline_gcs import GCSPipeline
-
-
-def setup_logging(level: str) -> None:
-    """Configure logging with the specified level."""
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -104,6 +97,11 @@ Environment Variables:
         action="store_true",
         help="Force re-indexing even if files already exist in Qdrant",
     )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Process files sequentially instead of in parallel",
+    )
     
     # Advanced processing options (usually from config file)
     parser.add_argument(
@@ -148,9 +146,23 @@ def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
     
-    # Setup logging
-    setup_logging(args.log_level)
+    # Generate log file names with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path("logs")
+    log_file = log_dir / f"pipeline_{timestamp}.log"
+    error_file = log_dir / f"errors_{timestamp}.log"
+    
+    # Setup logging with file outputs
+    console_handler = setup_logging(
+        level=args.log_level,
+        log_file=log_file,
+        error_file=error_file,
+        summary_interval=50,
+    )
     logger = logging.getLogger(__name__)
+    
+    logger.info(f"Logging to: {log_file}")
+    logger.info(f"Errors to: {error_file}")
     
     # Load config file
     if not args.config.exists():
@@ -174,21 +186,29 @@ def main() -> int:
         return 1
     
     # Log configuration
-    logger.info(f"Source bucket: gs://{config.source_bucket}/{config.source_prefix}")
-    logger.info(f"Cache bucket: gs://{config.cache_bucket}/{config.cache_prefix}")
-    logger.info(f"Qdrant URL: {config.qdrant.url}")
+    logger.info(f"Source: gs://{config.source_bucket}/{config.source_prefix}")
+    logger.info(f"Cache: gs://{config.cache_bucket}/{config.cache_prefix}")
+    logger.info(f"Qdrant: {config.qdrant.url}")
+    logger.info(f"Workers: {config.workers}, max_pending: {config.max_pending}")
     if args.dry_run:
         logger.info("DRY RUN mode - no writes will be made")
     if args.force:
         logger.info("FORCE mode - will re-index all files")
+    if args.sequential:
+        logger.info("SEQUENTIAL mode - processing one file at a time")
     
     # Create and run pipeline
     try:
         pipeline = GCSPipeline(config=config)
+        
+        # Connect console handler to progress tracker for periodic summaries
+        console_handler.set_progress_tracker(pipeline.progress)
+        
         progress = pipeline.run(
             prefix=args.prefix,
             dry_run=args.dry_run,
             limit=args.limit,
+            parallel=not args.sequential,
         )
         
         # Return non-zero if there were failures

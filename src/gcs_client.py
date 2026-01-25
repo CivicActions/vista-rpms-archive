@@ -99,7 +99,13 @@ class GCSClient:
         """
         try:
             content = blob.download_as_bytes()
-            logger.debug(f"Downloaded {blob.name} ({len(content)} bytes)")
+            size_kb = len(content) / 1024
+            if size_kb > 1024:
+                logger.info(f"Downloaded {blob.name} ({size_kb/1024:.1f} MB)")
+            elif size_kb > 100:
+                logger.info(f"Downloaded {blob.name} ({size_kb:.0f} KB)")
+            else:
+                logger.debug(f"Downloaded {blob.name} ({size_kb:.1f} KB)")
             return content
         except GoogleCloudError as e:
             logger.error(f"Failed to download blob {blob.name}: {e}")
@@ -134,7 +140,13 @@ class GCSClient:
         
         try:
             blob.download_to_filename(str(temp_path))
-            logger.debug(f"Downloaded {blob.name} to {temp_path}")
+            size_kb = temp_path.stat().st_size / 1024
+            if size_kb > 1024:
+                logger.info(f"Downloaded {blob.name} to temp ({size_kb/1024:.1f} MB)")
+            elif size_kb > 100:
+                logger.info(f"Downloaded {blob.name} to temp ({size_kb:.0f} KB)")
+            else:
+                logger.debug(f"Downloaded {blob.name} to temp ({size_kb:.1f} KB)")
             return temp_path
         except Exception:
             # Clean up temp file on error
@@ -209,7 +221,13 @@ class GCSClient:
         
         try:
             blob.download_to_filename(str(temp_path))
-            logger.debug(f"Downloaded {source_path} to {temp_path}")
+            size_kb = temp_path.stat().st_size / 1024
+            if size_kb > 1024:
+                logger.info(f"Downloaded {source_path} to temp ({size_kb/1024:.1f} MB)")
+            elif size_kb > 100:
+                logger.info(f"Downloaded {source_path} to temp ({size_kb:.0f} KB)")
+            else:
+                logger.debug(f"Downloaded {source_path} to temp ({size_kb:.1f} KB)")
             return temp_path
         except Exception:
             # Clean up temp file on error
@@ -228,7 +246,11 @@ class GCSClient:
             content,
             content_type="text/markdown",
         )
-        logger.debug(f"Uploaded markdown to {cache_path}")
+        size_kb = len(content.encode('utf-8')) / 1024
+        if size_kb > 100:
+            logger.info(f"Uploaded markdown to {cache_path} ({size_kb:.0f} KB)")
+        else:
+            logger.debug(f"Uploaded markdown to {cache_path} ({size_kb:.1f} KB)")
     
     def read_cached_markdown(self, cache_path: str) -> str:
         """Read cached markdown content from GCS.
