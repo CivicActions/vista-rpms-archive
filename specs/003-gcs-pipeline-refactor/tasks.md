@@ -136,11 +136,11 @@
 **Purpose**: End-to-end testing of all user stories
 
 - [X] T036 Validate GCS iteration (empty prefix, nested directories, large file counts)
-- [ ] T037 Validate skip detection (re-runs skip indexed files) - requires Qdrant
+- [X] T037 Validate skip detection (re-runs skip indexed files) - requires Qdrant
 - [X] T038 Validate archive processing (ZIP, TAR, nested archives) - code complete
 - [X] T039 Validate GCS cache (check before process, cache after process) - code complete
 - [X] T040 Validate dry-run mode (no writes, correct reporting)
-- [ ] T041 Run full pipeline against production GCS bucket - requires Qdrant
+- [X] T041 Run full pipeline against production GCS bucket (10 files validated)
 
 **Checkpoint**: All success criteria validated
 
