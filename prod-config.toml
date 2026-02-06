@@ -10,6 +10,9 @@ cache_prefix = "cache/"
 
 [processing]
 workers = 14
+# WARNING: High max_pending causes high memory usage.
+# Estimate: workers * max_pending * ~10MB per task = ~3.9GB memory overhead
+# If OOM occurs, reduce max_pending to 10 or lower, or reduce workers to 8
 max_pending = 28
 batch_size = 100
 timeout = 600

@@ -4,7 +4,10 @@ This pipeline iterates directly over GCS files, using Qdrant as the sole
 source of truth for tracking indexed files. No local SQLite or index.json.
 """
 
+import gc
 import logging
+import os
+import psutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -36,6 +39,20 @@ def _short_path(path: str) -> str:
     if path.startswith('source/'):
         return path[7:]
     return path
+
+
+def _log_memory_usage() -> None:
+    """Log current memory usage."""
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        mem_percent = process.memory_percent()
+        logger.debug(
+            f"Memory usage: {mem_info.rss / 1024 / 1024:.1f} MB "
+            f"({mem_percent:.1f}% of system)"
+        )
+    except Exception:
+        pass  # psutil not available or error
 
 
 @dataclass
@@ -208,6 +225,17 @@ class GCSPipeline:
         """
         try:
             logger.info(f"Starting GCS pipeline run (dry_run={dry_run}, limit={limit}, parallel={parallel})")
+            _log_memory_usage()
+            
+            # Warn if max_pending is too high for memory constraints
+            if parallel and self.config.workers > 1:
+                max_memory_estimate_mb = (self.config.workers * self.config.max_pending * 10)  # ~10MB per pending task estimate
+                if max_memory_estimate_mb > 5000:  # > 5GB
+                    logger.warning(
+                        f"High memory usage expected: workers={self.config.workers}, "
+                        f"max_pending={self.config.max_pending} (~{max_memory_estimate_mb}MB). "
+                        f"If OOM occurs, reduce max_pending or workers in config."
+                    )
             
             # Preload embedding model before starting parallel workers
             # to avoid race conditions during model download
@@ -321,9 +349,16 @@ class GCSPipeline:
                             # catches exceptions, but just in case
                             logger.error(f"[{_short_path(blob.name)}] Executor error: {e}")
                         
-                        # Log progress periodically
+                        # Log progress periodically with memory tracking
                         if done_count % 100 == 0:
                             logger.info(self.progress.get_progress_str())
+                            _log_memory_usage()
+                        
+                        # Run garbage collection periodically
+                        if done_count % 500 == 0:
+                            logger.debug("Running garbage collection...")
+                            gc.collect()
+                            _log_memory_usage()
                     
                     logger.debug(f"Tasks completed: {done_count}, pending: {len(pending)}")
                     
@@ -358,10 +393,15 @@ class GCSPipeline:
         try:
             self._process_blob(blob, dry_run=dry_run)
         except Exception as e:
-            logger.error(f"Error processing blob {blob.name}: {e}")
+            logger.error(f"[{_short_path(blob.name)}] Processing error: {e}")
             self._log_error(blob.name, str(e))
             self.progress.mark_extraction_failed()
+        finally:
+            # Always mark as processed and attempt cleanup
             self.progress.mark_processed()
+            # Hint to Python to clean up unused objects
+            gc.collect()
+
     
     def _process_blob(self, blob: storage.Blob, dry_run: bool = False) -> None:
         """Process a single GCS blob.
