@@ -206,36 +206,44 @@ class GCSPipeline:
         Returns:
             ProgressTracker with run statistics.
         """
-        logger.info(f"Starting GCS pipeline run (dry_run={dry_run}, limit={limit}, parallel={parallel})")
-        
-        # Preload embedding model before starting parallel workers
-        # to avoid race conditions during model download
-        if not dry_run and self.indexer:
-            self.indexer.preload()
-        
-        # Collect blobs to process
-        blobs_to_process = []
-        for blob in self.gcs_client.list_blobs(prefix=prefix):
-            blobs_to_process.append(blob)
-            if limit and len(blobs_to_process) >= limit:
-                break
-        
-        self.progress.total_blobs = len(blobs_to_process)
-        logger.info(f"Found {len(blobs_to_process)} blobs to process")
-        
-        if not blobs_to_process:
+        try:
+            logger.info(f"Starting GCS pipeline run (dry_run={dry_run}, limit={limit}, parallel={parallel})")
+            
+            # Preload embedding model before starting parallel workers
+            # to avoid race conditions during model download
+            if not dry_run and self.indexer:
+                self.indexer.preload()
+            
+            # Collect blobs to process
+            blobs_to_process = []
+            for blob in self.gcs_client.list_blobs(prefix=prefix):
+                blobs_to_process.append(blob)
+                if limit and len(blobs_to_process) >= limit:
+                    break
+            
+            self.progress.total_blobs = len(blobs_to_process)
+            logger.info(f"Found {len(blobs_to_process)} blobs to process")
+            
+            if not blobs_to_process:
+                logger.info("No blobs to process")
+                return self.progress
+            
+            # Process blobs
+            logger.info(f"Starting blob processing (parallel={parallel})")
+            if parallel and self.config.workers > 1:
+                self._run_parallel(blobs_to_process, dry_run=dry_run)
+            else:
+                self._run_sequential(blobs_to_process, dry_run=dry_run)
+            
+            logger.info("Blob processing complete")
+            
+            # Final summary
+            logger.info(self.progress.get_summary())
+            
             return self.progress
-        
-        # Process blobs
-        if parallel and self.config.workers > 1:
-            self._run_parallel(blobs_to_process, dry_run=dry_run)
-        else:
-            self._run_sequential(blobs_to_process, dry_run=dry_run)
-        
-        # Final summary
-        logger.info(self.progress.get_summary())
-        
-        return self.progress
+        except Exception as e:
+            logger.error(f"Pipeline run failed: {e}", exc_info=True)
+            raise
     
     def _run_sequential(
         self,
@@ -281,47 +289,57 @@ class GCSPipeline:
             f"(max_pending={max_pending})"
         )
         
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            # Track pending futures for backpressure
-            pending: dict = {}
-            blob_iter = iter(blobs)
-            done_count = 0
-            
-            # Submit initial batch up to max_pending
-            for blob in blob_iter:
-                if len(pending) >= max_pending:
-                    break
-                future = executor.submit(self._process_blob_with_error_handling, blob, dry_run)
-                pending[future] = blob
-            
-            # Process results and submit more as capacity allows
-            while pending:
-                # Wait for at least one to complete
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                # Track pending futures for backpressure
+                pending: dict = {}
+                blob_iter = iter(blobs)
+                done_count = 0
                 
-                for future in done:
-                    blob = pending.pop(future)
-                    done_count += 1
-                    
-                    try:
-                        future.result()  # Raises if there was an exception
-                    except Exception as e:
-                        # This shouldn't happen since _process_blob_with_error_handling
-                        # catches exceptions, but just in case
-                        logger.error(f"Unexpected error processing {blob.name}: {e}")
-                    
-                    # Log progress periodically
-                    if done_count % 100 == 0:
-                        logger.info(self.progress.get_progress_str())
-                
-                # Submit more tasks up to max_pending
+                # Submit initial batch up to max_pending
                 for blob in blob_iter:
                     if len(pending) >= max_pending:
                         break
                     future = executor.submit(self._process_blob_with_error_handling, blob, dry_run)
                     pending[future] = blob
-        
-        logger.info(f"Completed: {self.progress.get_progress_str()}")
+                
+                logger.debug(f"Initial batch submitted: {len(pending)} tasks")
+                
+                # Process results and submit more as capacity allows
+                while pending:
+                    # Wait for at least one to complete
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    
+                    for future in done:
+                        blob = pending.pop(future)
+                        done_count += 1
+                        
+                        try:
+                            future.result()  # Raises if there was an exception
+                        except Exception as e:
+                            # This shouldn't happen since _process_blob_with_error_handling
+                            # catches exceptions, but just in case
+                            logger.error(f"[{_short_path(blob.name)}] Executor error: {e}")
+                        
+                        # Log progress periodically
+                        if done_count % 100 == 0:
+                            logger.info(self.progress.get_progress_str())
+                    
+                    logger.debug(f"Tasks completed: {done_count}, pending: {len(pending)}")
+                    
+                    # Submit more tasks up to max_pending
+                    for blob in blob_iter:
+                        if len(pending) >= max_pending:
+                            break
+                        future = executor.submit(self._process_blob_with_error_handling, blob, dry_run)
+                        pending[future] = blob
+                
+                logger.info(f"All parallel tasks completed: {done_count} processed")
+            
+            logger.info(f"Executor shutdown complete: {self.progress.get_progress_str()}")
+        except Exception as e:
+            logger.error(f"Parallel processing failed: {e}", exc_info=True)
+            raise
     
     def _process_blob_with_error_handling(
         self,

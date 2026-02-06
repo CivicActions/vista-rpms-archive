@@ -9,8 +9,7 @@ ORG=WorldVistA
 mkdir /data/source/$ORG
 cd /data/source/$ORG
 gh repo list $ORG --limit 1000 --json name --jq '.[].name' | while read -r REPO; do
-    gh repo archive "$ORG/$REPO" --format zip --dest "$REPO.zip"
-    mkdir -p "$REPO"
-    unzip -q "$REPO.zip" -d "$REPO"
-    rm "$REPO.zip"
+    gh repo clone "$ORG/$REPO" "$REPO" -- --depth 1
 done
+git worktree add ../VistA-M-foia foia
+gsutil
