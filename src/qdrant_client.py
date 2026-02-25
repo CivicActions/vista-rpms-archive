@@ -49,6 +49,55 @@ def get_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
 
 
+# Maximum payload size Qdrant will accept (32MB).
+# Content must be chunked below this to avoid 400 errors.
+QDRANT_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+
+# Target chunk size in characters. Qdrant's 32MB limit is on the JSON payload
+# which includes metadata overhead, so we target ~4MB of text per chunk.
+# This also keeps embedding input at a reasonable size.
+CHUNK_TARGET_CHARS = 4 * 1024 * 1024  # 4MB of text
+
+# Overlap between chunks in characters to preserve context across boundaries.
+CHUNK_OVERLAP_CHARS = 2000
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_TARGET_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
+    """Split text into overlapping chunks.
+    
+    Splits on line boundaries where possible to avoid breaking mid-line.
+    
+    Args:
+        text: Full document text.
+        chunk_size: Target chunk size in characters.
+        overlap: Overlap between chunks in characters.
+    
+    Returns:
+        List of text chunks. Returns [text] if no chunking needed.
+    """
+    if len(text) <= chunk_size:
+        return [text]
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+        
+        # Try to break at a line boundary within the last 10% of the chunk
+        search_start = end - (chunk_size // 10)
+        newline_pos = text.rfind('\n', search_start, end)
+        if newline_pos > start:
+            end = newline_pos + 1  # Include the newline
+        
+        chunks.append(text[start:end])
+        start = end - overlap
+    
+    return chunks
+
+
 class QdrantIndexer:
     """Manages document indexing in Qdrant vector database.
     
@@ -319,9 +368,12 @@ class QdrantIndexer:
         force: bool = False,
         is_source_code: bool = False,
     ) -> IndexingResult:
-        """Index a document into Qdrant.
+        """Index a document into Qdrant, chunking if needed.
         
-        Handles routing, skip detection, embedding, and upsert.
+        Large documents are automatically split into chunks that each
+        fit within Qdrant's payload size limit. Each chunk is stored
+        as a separate point. Chunk 0 keeps the original point ID so
+        that exists_by_path skip detection still works.
         
         Args:
             source_path: GCS source path of the document.
@@ -351,7 +403,7 @@ class QdrantIndexer:
                     error=f"Failed to ensure collection: {e}",
                 )
         
-        # Calculate content hash
+        # Calculate content hash over full content for skip detection
         content_hash = get_content_hash(content)
         
         # Check if already indexed with same content (skip if force=True)
@@ -367,68 +419,124 @@ class QdrantIndexer:
                 logger.warning(f"Skip check failed for '{source_path}': {e}")
                 # Continue with indexing if check fails
         
-        # Generate embedding
-        try:
-            vector = self.embedder.embed(content)
-        except Exception as e:
+        # Split into chunks if content is large
+        chunks = chunk_text(content)
+        if len(chunks) > 1:
+            logger.info(
+                f"Chunking '{source_path}' into {len(chunks)} chunks "
+                f"({len(content)} chars total)"
+            )
+        
+        # Dry run mode
+        if dry_run:
+            logger.debug(f"Dry run: would index '{source_path}' to '{collection_name}' ({len(chunks)} chunks)")
             return IndexingResult(
                 source_path=source_path,
                 collection=collection_name,
-                status="failed",
-                error=f"Embedding failed: {e}",
+                status="indexed",
             )
         
-        # Prepare payload - compatible with mcp-server-qdrant
-        # mcp-server-qdrant expects: {"document": text, "metadata": {...}}
+        # Index each chunk as a separate point
+        indexed_count = 0
+        for chunk_idx, chunk_text_content in enumerate(chunks):
+            try:
+                self._upsert_chunk(
+                    source_path=source_path,
+                    chunk_text=chunk_text_content,
+                    chunk_index=chunk_idx,
+                    total_chunks=len(chunks),
+                    content_hash=content_hash,
+                    collection_name=collection_name,
+                    cache_path=cache_path,
+                    file_size=file_size,
+                    original_format=original_format,
+                )
+                indexed_count += 1
+            except Exception as e:
+                error_msg = f"Upsert failed for chunk {chunk_idx}/{len(chunks)}: {e}"
+                logger.error(f"[{source_path}] {error_msg}")
+                return IndexingResult(
+                    source_path=source_path,
+                    collection=collection_name,
+                    status="failed",
+                    error=error_msg,
+                )
+        
+        if len(chunks) > 1:
+            logger.debug(f"Indexed '{source_path}' to '{collection_name}' ({indexed_count} chunks)")
+        else:
+            logger.debug(f"Indexed '{source_path}' to collection '{collection_name}'")
+        
+        return IndexingResult(
+            source_path=source_path,
+            collection=collection_name,
+            status="indexed",
+        )
+    
+    def _upsert_chunk(
+        self,
+        source_path: str,
+        chunk_text: str,
+        chunk_index: int,
+        total_chunks: int,
+        content_hash: str,
+        collection_name: str,
+        cache_path: str,
+        file_size: int,
+        original_format: str,
+    ) -> None:
+        """Upsert a single chunk to Qdrant.
+        
+        Chunk 0 uses the base point ID (from source_path) so that
+        exists_by_path skip detection still works. Subsequent chunks
+        use deterministic IDs derived from '{source_path}#chunk{N}'.
+        
+        Args:
+            source_path: GCS source path of the document.
+            chunk_text: Text content of this chunk.
+            chunk_index: 0-based chunk index.
+            total_chunks: Total number of chunks for this document.
+            content_hash: Hash of the full document content.
+            collection_name: Target Qdrant collection.
+            cache_path: GCS cache path.
+            file_size: Original file size.
+            original_format: Original file extension.
+        """
+        # Chunk 0 uses base ID; subsequent chunks use derived IDs
+        if chunk_index == 0:
+            point_id = get_point_id(source_path)
+        else:
+            point_id = get_point_id(f"{source_path}#chunk{chunk_index}")
+        
+        # Generate embedding for this chunk's text
+        vector = self.embedder.embed(chunk_text)
+        
+        # Build payload compatible with mcp-server-qdrant
         payload = {
-            "document": content,  # Required by mcp-server-qdrant
-            "metadata": {  # Nested metadata dict for mcp-server-qdrant compatibility
+            "document": chunk_text,
+            "metadata": {
                 "source_path": source_path,
                 "content_hash": content_hash,
                 "indexed_at": datetime.now(timezone.utc).isoformat(),
                 "file_size": file_size,
                 "original_format": original_format,
                 "cache_path": cache_path,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
             },
-            # Also keep top-level fields for our own skip detection
             "content_hash": content_hash,
         }
         
-        # Dry run mode - return what would be indexed without writing
-        if dry_run:
-            logger.debug(f"Dry run: would index '{source_path}' to '{collection_name}'")
-            return IndexingResult(
-                source_path=source_path,
-                collection=collection_name,
-                status="indexed",  # Would be indexed
-            )
-        
-        # Upsert to Qdrant
-        try:
-            point_id = get_point_id(source_path)
-            self.client.upsert(
-                collection_name=collection_name,
-                points=[
-                    models.PointStruct(
-                        id=point_id,
-                        vector={self.VECTOR_NAME: vector},  # Named vector
-                        payload=payload,
-                    )
-                ],
-            )
-            logger.debug(f"Indexed '{source_path}' to collection '{collection_name}'")
-            return IndexingResult(
-                source_path=source_path,
-                collection=collection_name,
-                status="indexed",
-            )
-        except Exception as e:
-            return IndexingResult(
-                source_path=source_path,
-                collection=collection_name,
-                status="failed",
-                error=f"Upsert failed: {e}",
-            )
+        self.client.upsert(
+            collection_name=collection_name,
+            points=[
+                models.PointStruct(
+                    id=point_id,
+                    vector={self.VECTOR_NAME: vector},
+                    payload=payload,
+                )
+            ],
+        )
     
     def close(self) -> None:
         """Close connection to Qdrant."""

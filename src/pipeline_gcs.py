@@ -4,10 +4,12 @@ This pipeline iterates directly over GCS files, using Qdrant as the sole
 source of truth for tracking indexed files. No local SQLite or index.json.
 """
 
+import atexit
 import gc
 import logging
 import os
 import psutil
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -53,6 +55,38 @@ def _log_memory_usage() -> None:
         )
     except Exception:
         pass  # psutil not available or error
+
+
+def _install_crash_handlers() -> None:
+    """Install atexit and signal handlers to log unexpected terminations.
+    
+    Helps diagnose OOM kills and other silent exits by ensuring
+    a final log message is written whenever possible.
+    """
+    _crash_handlers_state = {"clean_exit": False}
+
+    def _atexit_handler():
+        if not _crash_handlers_state["clean_exit"]:
+            logger.error(
+                "UNEXPECTED EXIT: Pipeline did not complete normally. "
+                "This is likely an OOM kill (check dmesg or /var/log/kern.log)."
+            )
+            _log_memory_usage()
+            logging.shutdown()
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.error(f"SIGNAL RECEIVED: {sig_name} ({signum}) — shutting down")
+        _log_memory_usage()
+        logging.shutdown()
+        # Re-raise with default handler so exit code is correct
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    atexit.register(_atexit_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    return _crash_handlers_state
 
 
 @dataclass
@@ -227,6 +261,9 @@ class GCSPipeline:
             logger.info(f"Starting GCS pipeline run (dry_run={dry_run}, limit={limit}, parallel={parallel})")
             _log_memory_usage()
             
+            # Install crash handlers to diagnose OOM kills and other silent exits
+            crash_state = _install_crash_handlers()
+            
             # Warn if max_pending is too high for memory constraints
             if parallel and self.config.workers > 1:
                 max_memory_estimate_mb = (self.config.workers * self.config.max_pending * 10)  # ~10MB per pending task estimate
@@ -242,32 +279,53 @@ class GCSPipeline:
             if not dry_run and self.indexer:
                 self.indexer.preload()
             
-            # Collect blobs to process
-            blobs_to_process = []
-            for blob in self.gcs_client.list_blobs(prefix=prefix):
-                blobs_to_process.append(blob)
-                if limit and len(blobs_to_process) >= limit:
-                    break
+            # Count blobs via streaming iterator to avoid loading all blob
+            # objects into memory (526K+ blobs can consume tens of GB of RAM).
+            blob_iter = self.gcs_client.list_blobs(prefix=prefix)
             
-            self.progress.total_blobs = len(blobs_to_process)
-            logger.info(f"Found {len(blobs_to_process)} blobs to process")
+            if limit:
+                # With a limit, it's safe to collect into a small list
+                blobs_to_process = []
+                for blob in blob_iter:
+                    blobs_to_process.append(blob)
+                    if len(blobs_to_process) >= limit:
+                        break
+                self.progress.total_blobs = len(blobs_to_process)
+                blob_iter = iter(blobs_to_process)
+            else:
+                # Without a limit, count blobs first by streaming (only names, not full objects)
+                logger.info("Counting blobs in bucket (streaming)...")
+                count = 0
+                for _ in self.gcs_client.list_blobs(prefix=prefix):
+                    count += 1
+                    if count % 100000 == 0:
+                        logger.info(f"  ...counted {count} blobs so far")
+                self.progress.total_blobs = count
+                logger.info(f"Found {count} blobs to process")
+                _log_memory_usage()
+                # Re-create iterator for actual processing
+                blob_iter = self.gcs_client.list_blobs(prefix=prefix)
             
-            if not blobs_to_process:
+            logger.info(f"Total blobs to process: {self.progress.total_blobs}")
+            
+            if self.progress.total_blobs == 0:
                 logger.info("No blobs to process")
+                crash_state["clean_exit"] = True
                 return self.progress
             
             # Process blobs
             logger.info(f"Starting blob processing (parallel={parallel})")
             if parallel and self.config.workers > 1:
-                self._run_parallel(blobs_to_process, dry_run=dry_run)
+                self._run_parallel(blob_iter, dry_run=dry_run)
             else:
-                self._run_sequential(blobs_to_process, dry_run=dry_run)
+                self._run_sequential(blob_iter, dry_run=dry_run)
             
             logger.info("Blob processing complete")
             
             # Final summary
             logger.info(self.progress.get_summary())
             
+            crash_state["clean_exit"] = True
             return self.progress
         except Exception as e:
             logger.error(f"Pipeline run failed: {e}", exc_info=True)
@@ -275,13 +333,13 @@ class GCSPipeline:
     
     def _run_sequential(
         self,
-        blobs: list[storage.Blob],
+        blobs: Iterator[storage.Blob],
         dry_run: bool = False,
     ) -> None:
         """Process blobs sequentially.
         
         Args:
-            blobs: List of blobs to process.
+            blobs: Iterator of blobs to process.
             dry_run: If True, don't write to Qdrant or GCS cache.
         """
         for i, blob in enumerate(blobs):
@@ -298,22 +356,23 @@ class GCSPipeline:
     
     def _run_parallel(
         self,
-        blobs: list[storage.Blob],
+        blobs: Iterator[storage.Blob],
         dry_run: bool = False,
     ) -> None:
         """Process blobs in parallel with backpressure control.
         
         Uses ThreadPoolExecutor with max_pending to control memory usage.
+        Accepts an iterator to avoid holding all blob objects in memory.
         
         Args:
-            blobs: List of blobs to process.
+            blobs: Iterator of blobs to process.
             dry_run: If True, don't write to Qdrant or GCS cache.
         """
         workers = self.config.workers
         max_pending = self.config.max_pending
         
         logger.info(
-            f"Processing {len(blobs)} files with {workers} workers "
+            f"Processing {self.progress.total_blobs} files with {workers} workers "
             f"(max_pending={max_pending})"
         )
         
@@ -429,10 +488,24 @@ class GCSPipeline:
             return
         
         # Check if already indexed in Qdrant (skip detection)
+        # Route first to determine target collection, then check only that
+        # collection instead of all collections (reduces HTTP requests from
+        # N collections to 1 per blob).
         # Skip this check in dry-run mode to avoid needing Qdrant connection
         if not dry_run and not self.config.force and self.indexer:
+            # Pre-route: check both doc and source collection variants
+            base_collection = self.indexer.router.route(source_path)
+            source_collection = f"{base_collection}-source"
             try:
-                exists, collection = self.indexer.exists_by_path(source_path)
+                exists, collection = self.indexer.exists_by_path(
+                    source_path,
+                    collection_name=base_collection,
+                )
+                if not exists:
+                    exists, collection = self.indexer.exists_by_path(
+                        source_path,
+                        collection_name=source_collection,
+                    )
                 if exists:
                     logger.info(f"[{_short_path(source_path)}] Skipped (indexed in {collection})")
                     self.progress.mark_skipped_indexed()
@@ -441,6 +514,22 @@ class GCSPipeline:
             except Exception as e:
                 logger.warning(f"[{_short_path(source_path)}] Skip check failed: {e}")
                 # Continue processing if skip check fails
+        
+        # For large files, download to temp file instead of loading entirely
+        # into memory. This prevents OOM when multiple workers hit large files
+        # concurrently. Chunking in index_document handles the Qdrant payload
+        # size limit. Classification only needs the first few KB.
+        MAX_INMEMORY_BYTES = 32 * 1024 * 1024  # 32MB
+        file_size = blob.size or 0
+        
+        if file_size > MAX_INMEMORY_BYTES:
+            logger.info(
+                f"[{_short_path(source_path)}] Large file "
+                f"({file_size / 1024 / 1024:.1f} MB), using temp file"
+            )
+            self._process_large_blob(blob, source_path, file_size, dry_run=dry_run)
+            self.progress.mark_processed()
+            return
         
         # Download blob content for classification
         try:
@@ -495,6 +584,122 @@ class GCSPipeline:
         
         self.progress.mark_processed()
     
+    def _process_large_blob(
+        self,
+        blob: storage.Blob,
+        source_path: str,
+        file_size: int,
+        dry_run: bool = False,
+    ) -> None:
+        """Process a large blob via temp file to avoid holding it in memory.
+        
+        Downloads to disk, classifies from the first bytes, and reads
+        content from disk for indexing. Chunking in index_document
+        handles splitting into Qdrant-compatible payloads.
+        
+        Args:
+            blob: GCS Blob object.
+            source_path: GCS source path.
+            file_size: File size in bytes.
+            dry_run: If True, don't write to Qdrant or GCS cache.
+        """
+        temp_path = None
+        try:
+            temp_path = self.gcs_client.download_blob_to_temp(blob)
+            
+            # Read first 8KB for classification
+            with open(temp_path, 'rb') as f:
+                header = f.read(8192)
+            
+            classification = classify_file(source_path, header)
+            logger.debug(
+                f"[{_short_path(source_path)}] Classified (large): "
+                f"{classification.category.value} ({classification.reason})"
+            )
+            
+            if classification.category == FileCategory.BINARY:
+                if self._is_archive_mime(header):
+                    # Re-read full content for archive processing
+                    with open(temp_path, 'rb') as f:
+                        content = f.read()
+                    self._process_archive(blob, content, source_path, dry_run=dry_run)
+                    del content
+                else:
+                    logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
+                    self.progress.mark_skipped_binary()
+                return
+            
+            if not is_indexable_category(classification.category):
+                logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
+                self.progress.mark_skipped_binary()
+                return
+            
+            # Read full content from disk (not from GCS again)
+            try:
+                with open(temp_path, 'r', encoding='utf-8', errors='replace') as f:
+                    text_content = f.read()
+            except Exception as e:
+                logger.error(f"[{_short_path(source_path)}] Failed to read temp file: {e}")
+                self.progress.mark_extraction_failed()
+                return
+            
+            if is_source_category(classification.category):
+                self._process_source_file(
+                    source_path=source_path,
+                    content=text_content.encode('utf-8', errors='replace'),
+                    classification=classification,
+                    file_size=file_size,
+                    dry_run=dry_run,
+                )
+            else:
+                # Large doc file — use docling via temp path
+                cache_path = self.gcs_client.cache_path_for_source(source_path)
+                markdown = self._extract_with_docling(
+                    source_path=source_path,
+                    temp_path=temp_path,
+                    cache_path=cache_path,
+                    dry_run=dry_run,
+                )
+                if markdown is None:
+                    self.progress.mark_extraction_failed()
+                    return
+                
+                if dry_run:
+                    logger.info(f"[{_short_path(source_path)}] [DRY RUN] Would index large doc")
+                    self.progress.mark_indexed()
+                    return
+                
+                if not self.indexer:
+                    return
+                
+                try:
+                    result = self.indexer.index_document(
+                        source_path=source_path,
+                        content=markdown,
+                        cache_path=cache_path,
+                        file_size=file_size,
+                        original_format=Path(source_path).suffix,
+                        is_source_code=False,
+                    )
+                    if result.status == "indexed":
+                        self.progress.mark_indexed()
+                        logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection}")
+                    elif result.status == "skipped":
+                        self.progress.mark_skipped_indexed()
+                    else:
+                        self.progress.mark_index_failed()
+                        logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
+                except Exception as e:
+                    logger.error(f"[{_short_path(source_path)}] Indexing error: {e}")
+                    self.progress.mark_index_failed()
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Large file processing failed: {e}")
+            self._log_error(source_path, f"Large file processing failed: {e}")
+            self.progress.mark_extraction_failed()
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
     def _is_archive_mime(self, content: bytes) -> bool:
         """Check if content is an archive by magic bytes."""
         # ZIP magic: PK\x03\x04
@@ -544,9 +749,14 @@ class GCSPipeline:
                     # Construct full source path: archive_name/relative_path
                     full_source_path = f"{archive_path}/{rel_path}"
                     
-                    # Check if already indexed
+                    # Check if already indexed — route first to avoid checking all collections
                     if not self.config.force and self.indexer:
-                        exists, _ = self.indexer.exists_by_path(full_source_path)
+                        base_coll = self.indexer.router.route(full_source_path)
+                        exists, _ = self.indexer.exists_by_path(full_source_path, collection_name=base_coll)
+                        if not exists:
+                            exists, _ = self.indexer.exists_by_path(
+                                full_source_path, collection_name=f"{base_coll}-source"
+                            )
                         if exists:
                             logger.debug(f"[{_short_path(full_source_path)}] Skipped (indexed)")
                             self.progress.mark_skipped_indexed()
