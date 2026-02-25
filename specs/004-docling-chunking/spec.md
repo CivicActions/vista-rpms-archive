@@ -28,13 +28,13 @@ As a user searching the VistA/RPMS knowledge base, I want large office documents
 
 As the system, I need all chunks to be sized within the embedding model's optimal token window, so that no content is truncated during embedding and retrieval quality is maximized.
 
-**Why this priority**: The current system chunks by character count (4MB target), which has no relationship to the embedding model's token limit (256 tokens for all-MiniLM-L6-v2). Oversized chunks are silently truncated by the embedding model, causing data loss. This is a correctness issue.
+**Why this priority**: The current system chunks by character count (4MB target), which has no relationship to the embedding model's token limit (512 tokens for all-MiniLM-L6-v2). Oversized chunks are silently truncated by the embedding model, causing data loss. This is a correctness issue.
 
 **Independent Test**: Process a large document and verify that every produced chunk, when tokenized with the embedding model's tokenizer, fits within the configured maximum token count.
 
 **Acceptance Scenarios**:
 
-1. **Given** the embedding model is `sentence-transformers/all-MiniLM-L6-v2` with a 256-token context window, **When** any document is chunked, **Then** no chunk exceeds 256 tokens when measured by the model's tokenizer.
+1. **Given** the embedding model is `sentence-transformers/all-MiniLM-L6-v2` with a 512-token max sequence length, **When** any document is chunked, **Then** no chunk exceeds 512 tokens when measured by the model's tokenizer.
 2. **Given** a chunk that would be undersized (e.g., 10 tokens), **When** it shares the same heading context as its neighbor, **Then** it is merged with its neighbor until the combined size approaches but does not exceed the token limit.
 3. **Given** the embedding model is changed in configuration, **When** the pipeline runs, **Then** the chunker automatically uses the new model's tokenizer and token limit for chunk sizing.
 
@@ -69,6 +69,7 @@ As a user performing filtered search, I want each chunk's Qdrant payload to incl
 1. **Given** a chunked document, **When** it is indexed to Qdrant, **Then** the payload includes Docling-provided metadata: heading hierarchy, document-level metadata, and chunk position information.
 2. **Given** a document chunk produced by Docling's `contextualize()` method, **When** it is embedded, **Then** the embedded text includes the heading context prepended to the chunk body, improving semantic retrieval.
 3. **Given** a source code chunk, **When** it is indexed, **Then** the payload includes file path, detected language, line ranges, and any extracted routine/label names.
+4. **Given** any chunk (document or source code) stored in Qdrant, **When** an MCP client retrieves it via `qdrant-find`, **Then** the metadata includes a browsable source URL and a concise location reference (page number or line range), enabling the user to navigate directly to the original source.
 
 ---
 
@@ -104,13 +105,17 @@ As an operator, I want the ability to re-index the entire corpus with the new ch
 - **FR-003**: System MUST enable `merge_peers=True` in the `HybridChunker` so that small adjacent chunks under the same heading are merged up to the token limit.
 - **FR-004**: System MUST use Docling's `contextualize()` method to produce embedding text that includes heading/section context prepended to chunk body.
 - **FR-005**: System MUST export Docling chunk metadata (`chunk.meta.export_json_dict()`) into the Qdrant payload alongside existing metadata fields.
-- **FR-006**: System MUST implement a custom code chunker for MUMPS source files that splits at label/routine boundaries and respects the embedding model's token limit.
+- **FR-006**: System MUST implement a custom code chunker for MUMPS source files that splits at label/routine boundaries and respects the embedding model's token limit. File-level header content (comments and documentation before the first label) MUST be emitted as its own separate chunk, as it typically contains the routine name, description, author, and patch history.
 - **FR-007**: System MUST include `chunk_index`, `total_chunks`, and `document_id` in every chunk's Qdrant payload.
 - **FR-008**: System MUST remove the current character-based `chunk_text()` function and replace it with the new Docling-based and code-aware chunking approach.
 - **FR-009**: System MUST handle the case where Docling structural parsing fails by falling back to token-window splitting on the raw extracted text.
-- **FR-010**: System MUST clean up orphaned chunk points when re-indexing a document that produces a different number of chunks than before (during `--force` mode).
+- **FR-010**: System MUST clean up orphaned chunk points when re-indexing a document (during `--force` mode) by querying Qdrant for all existing points matching `metadata.source_path` and deleting them before inserting new chunks. This ensures no stale chunks remain when a document's chunk count changes.
 - **FR-011**: System MUST support configurable token limits via the configuration file, defaulting to the embedding model's context window size.
 - **FR-012**: System MUST preserve backward compatibility with the existing Qdrant payload schema (the `document` and `metadata` field structure and the named vector format).
+- **FR-013**: System MUST include a browsable source URL in every chunk's metadata payload, reconstructed from the GCS source path by mapping the first path element to the domain and the remainder to the URL path (e.g., `source/www.va.gov/vdl/doc.pdf` → `https://www.va.gov/vdl/doc.pdf`; `source/WorldVistA/{repo}/{path}` → `https://github.com/WorldVistA/{repo}/{path}`). For httrack-mirrored HTML files with renamed filenames, the canonical URL MUST be extracted from the `<!-- Mirrored from ... -->` HTML comment.
+- **FR-014**: System MUST include location references in every chunk's metadata: page number(s) for office documents (when available from Docling) and `line_start`/`line_end` for source code files.
+- **FR-015**: Source URL and location references MUST be stored in the metadata payload (not embedded in the chunk text), to avoid wasting embedding tokens and diluting semantic meaning.
+- **FR-016**: System MUST cache the serialized `DoclingDocument` (as JSON) to GCS alongside the existing markdown cache, so that `HybridChunker` can operate on the rich document structure without re-converting from the source file on every run.
 
 ### Key Entities
 
@@ -123,23 +128,25 @@ As an operator, I want the ability to re-index the entire corpus with the new ch
 
 ### Measurable Outcomes
 
-- **SC-001**: No chunk produced by the system exceeds the embedding model's token limit (currently 256 tokens for all-MiniLM-L6-v2), verified by tokenizing every chunk during a test run.
+- **SC-001**: No chunk produced by the system exceeds the embedding model's token limit (512 tokens for all-MiniLM-L6-v2), verified by tokenizing every chunk during a test run.
 - **SC-002**: For structured documents (PDF with headings), at least 80% of produced chunks begin with or include their parent heading context.
 - **SC-003**: For MUMPS source files, at least 90% of chunks align with label/routine boundaries (i.e., do not split mid-routine).
 - **SC-004**: Average chunk size is within 50-100% of the target token limit (no excessive fragmentation), measured across a representative sample of 1000 documents.
-- **SC-005**: Qdrant payload for every chunk includes at minimum: `source_path`, `content_hash`, `chunk_index`, `total_chunks`, and `indexed_at` (preserving backward compatibility).
+- **SC-005**: Qdrant payload for every chunk includes at minimum: `source_path`, `source_url`, `content_hash`, `chunk_index`, `total_chunks`, `indexed_at`, and location references (`page` for documents, `line_start`/`line_end` for source code).
 - **SC-006**: Search result relevance improves qualitatively: a manual review of 20 sample queries shows retrieved chunks are self-contained and contextually meaningful (vs. current character-split fragments).
 - **SC-007**: Re-indexing with `--force` produces no orphaned points in Qdrant (old chunks from previous indexing are cleaned up).
+- **SC-008**: Every MCP search result includes a browsable source URL and a concise location reference (page or line range) enabling the user to trace back to the original document.
 
 ## Assumptions
 
-- The embedding model `sentence-transformers/all-MiniLM-L6-v2` has an effective context window of 256 tokens. Chunk targets will be set to this limit by default.
+- The embedding model `sentence-transformers/all-MiniLM-L6-v2` has a max sequence length of 512 tokens. Chunk targets will be set to 512 tokens by default.
 - Docling's `HybridChunker` is available in the installed version of the `docling` package (>=2.0.0).
 - MUMPS source files use standard conventions: labels start in column 1, routines are separated by labels, and comments begin with `;`.
 - The `contextualize()` output from Docling is suitable for direct embedding (i.e., it produces a single string combining heading context and chunk body).
 - The current `chunk.meta.export_json_dict()` format from Docling includes heading path and positional metadata.
 - Performance impact of using `HybridChunker` instead of the current character-based splitter is acceptable (Docling chunking should be fast relative to document conversion and embedding).
-- The GCS cache stores full markdown; chunking happens after cache retrieval, not before. Cache format does not need to change.
+- The GCS cache will store both the serialized `DoclingDocument` (as JSON) and the markdown export. Chunking operates on the cached `DoclingDocument` to preserve structural information required by `HybridChunker`. The markdown cache is retained for human-readable inspection.
+- The source URL is the original web URL reconstructed from the GCS source path: the first element after `source/` is the domain name, and the remainder forms the URL path (e.g., `source/www.va.gov/vdl/doc.pdf` → `https://www.va.gov/vdl/doc.pdf`). GitHub repos under `WorldVistA/` map to `https://github.com/WorldVistA/{repo}/{path}`. For httrack-mirrored HTML files whose filenames were renamed, the canonical URL is extracted from the `<!-- Mirrored from ... -->` HTML comment embedded by httrack.
 
 ## Dependencies
 
@@ -148,6 +155,16 @@ As an operator, I want the ability to re-index the entire corpus with the new ch
 - `transformers` (for `AutoTokenizer` to align with the embedding model)
 - `fastembed` (already a dependency; provides the embedding model)
 - Qdrant server with existing collections (backward compatible payload schema required)
+
+## Clarifications
+
+### Session 2025-02-25
+
+- Q: How should the pipeline cache documents for HybridChunker, given it requires a DoclingDocument object (not plain markdown)? → A: Cache serialized DoclingDocument JSON alongside markdown; chunk from cached DoclingDocument.
+- Q: What format should the source URL in chunk metadata use (GCS URL, gs:// URI, or original web URL)? → A: Reconstruct the original web URL from the GCS source path. The first path element after `source/` is the domain name (e.g., `source/www.va.gov/vdl/doc.pdf` → `https://www.va.gov/vdl/doc.pdf`). For httrack-mirrored HTML files, the canonical URL may be extracted from the `<!-- Mirrored from ... -->` HTML comment. For GitHub repos under `WorldVistA/`, construct `https://github.com/WorldVistA/{repo}/{path}`.
+- Q: What should the default token limit per chunk be (256, 384, or 512)? → A: 512 tokens — the model's actual max sequence length. Maximizes information density per chunk and reduces total chunk count.
+- Q: How should orphan chunk cleanup work during `--force` re-indexing? → A: Filter-delete: query Qdrant by `metadata.source_path` to find and delete all existing points for that document before inserting new chunks.
+- Q: Should MUMPS file header content (comments/docs before the first label) be a separate chunk or attached to the first routine? → A: Separate chunk. File headers often contain routine name, description, author, and patch history — useful retrieval targets on their own, semantically distinct from the first routine's code.
 
 ## Out of Scope
 
