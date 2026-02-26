@@ -3078,6 +3078,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "docling" },
+    { name = "docling-core", extra = ["chunking"] },
     { name = "google-cloud-storage" },
     { name = "psutil" },
     { name = "python-magic" },
@@ -3087,6 +3088,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "docling", specifier = ">=2.0.0" },
+    { name = "docling-core", extras = ["chunking"] },
     { name = "google-cloud-storage", specifier = ">=2.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "python-magic", specifier = ">=0.4.27" },

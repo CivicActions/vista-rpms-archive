@@ -21,6 +21,7 @@ from typing import Iterator, Optional
 from google.cloud import storage
 
 from .archive_extractor import ArchiveExtractor
+from .chunker import chunk_document, chunk_source_code, chunk_text_fallback
 from .extractor import Extractor, create_extractor
 from .file_classifier import (
     ClassificationResult,
@@ -30,8 +31,9 @@ from .file_classifier import (
     is_source_category,
 )
 from .gcs_client import GCSClient
-from .qdrant_client import QdrantIndexer
-from .types import Config, ExtractionResult, IndexingResult, ARCHIVE_MIME_TYPES, OFFICE_MIME_TYPES
+from .qdrant_client import QdrantIndexer, get_content_hash
+from .types import Config
+from .url_resolver import resolve_source_url
 
 logger = logging.getLogger(__name__)
 
@@ -517,7 +519,7 @@ class GCSPipeline:
         
         # For large files, download to temp file instead of loading entirely
         # into memory. This prevents OOM when multiple workers hit large files
-        # concurrently. Chunking in index_document handles the Qdrant payload
+        # concurrently. Chunking via index_chunks handles the Qdrant payload
         # size limit. Classification only needs the first few KB.
         MAX_INMEMORY_BYTES = 32 * 1024 * 1024  # 32MB
         file_size = blob.size or 0
@@ -594,7 +596,7 @@ class GCSPipeline:
         """Process a large blob via temp file to avoid holding it in memory.
         
         Downloads to disk, classifies from the first bytes, and reads
-        content from disk for indexing. Chunking in index_document
+        content from disk for indexing. Chunking via index_chunks
         handles splitting into Qdrant-compatible payloads.
         
         Args:
@@ -652,38 +654,96 @@ class GCSPipeline:
                     dry_run=dry_run,
                 )
             else:
-                # Large doc file — use docling via temp path
+                # Large doc file — extract DoclingDocument via temp path, chunk, index
                 cache_path = self.gcs_client.cache_path_for_source(source_path)
-                markdown = self._extract_with_docling(
-                    source_path=source_path,
-                    temp_path=temp_path,
-                    cache_path=cache_path,
-                    dry_run=dry_run,
-                )
-                if markdown is None:
-                    self.progress.mark_extraction_failed()
-                    return
-                
-                if dry_run:
-                    logger.info(f"[{_short_path(source_path)}] [DRY RUN] Would index large doc")
-                    self.progress.mark_indexed()
-                    return
                 
                 if not self.indexer:
                     return
                 
+                collection_name = self.indexer.router.route_with_category(source_path, is_source_code=False)
+                
+                # Try to extract DoclingDocument
+                doc = None
+                markdown_content = None
                 try:
-                    result = self.indexer.index_document(
-                        source_path=source_path,
-                        content=markdown,
-                        cache_path=cache_path,
+                    # For large files the content is already on disk as text_content
+                    # but may still be a binary doc that we read as text (lossy)
+                    # Check if it's UTF-8 clean  
+                    with open(temp_path, 'rb') as f:
+                        raw = f.read(512)
+                    try:
+                        raw.decode('utf-8', errors='strict')
+                        # Text doc — use text_content directly
+                        markdown_content = text_content
+                    except UnicodeDecodeError:
+                        pass
+                except Exception:
+                    pass
+                
+                if markdown_content is None:
+                    # Binary doc — extract with docling
+                    try:
+                        start_time = time.time()
+                        doc = self.extractor.extract_to_document(temp_path)
+                        elapsed = time.time() - start_time
+                        logger.debug(f"[{_short_path(source_path)}] Docling extraction took {elapsed:.1f}s")
+                        # Cache DoclingDocument JSON
+                        if not dry_run:
+                            try:
+                                self.gcs_client.upload_docling_json(source_path, doc.model_dump_json())
+                            except Exception as e:
+                                logger.warning(f"[{_short_path(source_path)}] Failed to cache DoclingDocument: {e}")
+                        # Get markdown
+                        markdown_content = doc.export_to_markdown()
+                        # Cache markdown
+                        if not dry_run:
+                            try:
+                                self.gcs_client.upload_markdown(cache_path, markdown_content)
+                            except Exception as e:
+                                logger.warning(f"[{_short_path(source_path)}] Failed to cache markdown: {e}")
+                    except Exception as e:
+                        logger.error(f"[{_short_path(source_path)}] Docling extraction failed: {e}")
+                        self._log_error(source_path, f"Docling extraction failed: {e}")
+                        self.progress.mark_extraction_failed()
+                        return
+                
+                # Resolve URL, hash, chunk, index
+                source_url = resolve_source_url(source_path, content=markdown_content)
+                content_hash = get_content_hash(markdown_content)
+                
+                try:
+                    if doc is not None:
+                        chunks = chunk_document(
+                            doc=doc,
+                            source_path=source_path,
+                            source_url=source_url,
+                            content_hash=content_hash,
+                        )
+                    else:
+                        chunks = chunk_text_fallback(
+                            text=markdown_content,
+                            source_path=source_path,
+                            source_url=source_url,
+                            content_hash=content_hash,
+                        )
+                except Exception as e:
+                    logger.error(f"[{_short_path(source_path)}] Chunking failed: {e}")
+                    self.progress.mark_extraction_failed()
+                    return
+                
+                try:
+                    result = self.indexer.index_chunks(
+                        chunks=chunks,
+                        collection_name=collection_name,
+                        force=self.config.force,
+                        dry_run=dry_run,
                         file_size=file_size,
                         original_format=Path(source_path).suffix,
-                        is_source_code=False,
+                        cache_path=cache_path,
                     )
                     if result.status == "indexed":
                         self.progress.mark_indexed()
-                        logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection}")
+                        logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
                     elif result.status == "skipped":
                         self.progress.mark_skipped_indexed()
                     else:
@@ -810,6 +870,9 @@ class GCSPipeline:
     ) -> None:
         """Process a source code file (direct indexing without docling).
         
+        Uses code-aware chunking (MUMPS label boundaries) and the new
+        index_chunks() API.
+        
         Args:
             source_path: GCS source path.
             content: File content bytes.
@@ -825,30 +888,50 @@ class GCSPipeline:
             self.progress.mark_extraction_failed()
             return
         
-        # Index to source collection
-        if dry_run:
-            logger.info(f"[{_short_path(source_path)}] [DRY RUN] Would index source")
-            self.progress.mark_indexed()
-            return
-        
         if not self.indexer:
             logger.warning(f"[{_short_path(source_path)}] No indexer available")
             return
         
+        # Resolve source URL (pass content for httrack comment detection)
+        source_url = resolve_source_url(source_path, content=text_content)
+        content_hash = get_content_hash(text_content)
+        
+        # Determine collection
+        collection_name = self.indexer.router.route_with_category(source_path, is_source_code=True)
+        
+        # Chunk using code-aware chunker
         try:
-            # Source files don't use cache - index directly
-            result = self.indexer.index_document(
+            chunks = chunk_source_code(
+                text=text_content,
                 source_path=source_path,
-                content=text_content,
-                cache_path="",  # No cache for source files
+                source_url=source_url,
+                content_hash=content_hash,
+            )
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Chunking failed: {e}")
+            self.progress.mark_extraction_failed()
+            return
+        
+        logger.debug(
+            f"[{_short_path(source_path)}] Chunked into {len(chunks)} chunks "
+            f"(chunker={chunks[0].metadata.get('chunker', '?') if chunks else '?'})"
+        )
+        
+        # Index chunks
+        try:
+            result = self.indexer.index_chunks(
+                chunks=chunks,
+                collection_name=collection_name,
+                force=self.config.force,
+                dry_run=dry_run,
                 file_size=file_size,
                 original_format=Path(source_path).suffix,
-                is_source_code=True,
+                cache_path="",  # No cache for source files
             )
             
             if result.status == "indexed":
                 self.progress.mark_indexed()
-                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection}")
+                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
             else:
@@ -868,6 +951,13 @@ class GCSPipeline:
     ) -> None:
         """Process a documentation file (with GCS cache and docling).
         
+        New flow:
+        1. Try to load cached DoclingDocument JSON, else extract via docling
+        2. Cache DoclingDocument JSON and markdown to GCS
+        3. Resolve source URL
+        4. Chunk via HybridChunker (falls back to text-fallback)
+        5. Index chunks via index_chunks()
+        
         Args:
             blob: GCS Blob object.
             source_path: GCS source path.
@@ -878,41 +968,112 @@ class GCSPipeline:
         cache_path = self.gcs_client.cache_path_for_source(source_path)
         file_size = blob.size or len(content)
         
-        # Get markdown content (from cache or via processing)
-        markdown_content = self._get_or_create_markdown(
-            source_path=source_path,
-            content=content,
-            blob=blob,
-            cache_path=cache_path,
-            dry_run=dry_run,
-        )
-        
-        if markdown_content is None:
-            self.progress.mark_extraction_failed()
-            return
-        
-        # Index the markdown
-        if dry_run:
-            logger.info(f"[{_short_path(source_path)}] [DRY RUN] Would index doc")
-            self.progress.mark_indexed()
-            return
-        
         if not self.indexer:
             return
         
+        # Determine collection
+        collection_name = self.indexer.router.route_with_category(source_path, is_source_code=False)
+        
+        # --- Step 1: Obtain DoclingDocument or markdown text ---
+        doc = None  # DoclingDocument if available
+        markdown_content = None
+        
+        # Check for cached DoclingDocument JSON first
+        if not self.config.force:
+            try:
+                cached_json = self.gcs_client.download_docling_json(source_path)
+                if cached_json:
+                    from docling_core.types import DoclingDocument
+                    doc = DoclingDocument.model_validate_json(cached_json)
+                    logger.debug(f"[{_short_path(source_path)}] Using cached DoclingDocument")
+            except Exception as e:
+                logger.debug(f"[{_short_path(source_path)}] DoclingDocument cache miss: {e}")
+        
+        if doc is None:
+            # Try text decode first (plain text / HTML doesn't need docling)
+            try:
+                text_content = content.decode('utf-8', errors='strict')
+                # Plain text / HTML text → use text fallback path
+                markdown_content = text_content
+                # Cache markdown
+                if not dry_run:
+                    try:
+                        self.gcs_client.upload_markdown(cache_path, markdown_content)
+                    except Exception as e:
+                        logger.warning(f"[{_short_path(source_path)}] Failed to cache text: {e}")
+            except UnicodeDecodeError:
+                # Binary document → extract via docling
+                doc = self._extract_docling_document(
+                    source_path=source_path,
+                    content=content,
+                    blob=blob,
+                    cache_path=cache_path,
+                    dry_run=dry_run,
+                )
+                if doc is None:
+                    self.progress.mark_extraction_failed()
+                    return
+        
+        # --- Step 2: Resolve source URL ---
+        source_url = resolve_source_url(source_path, content=markdown_content)
+        
+        # --- Step 3: Chunk ---
+        if markdown_content is not None:
+            content_hash = get_content_hash(markdown_content)
+        elif doc is not None:
+            # Use the markdown export for content hash
+            markdown_content = doc.export_to_markdown()
+            content_hash = get_content_hash(markdown_content)
+            # Also cache the markdown
+            if not dry_run:
+                try:
+                    self.gcs_client.upload_markdown(cache_path, markdown_content)
+                except Exception as e:
+                    logger.warning(f"[{_short_path(source_path)}] Failed to cache markdown: {e}")
+        else:
+            self.progress.mark_extraction_failed()
+            return
+        
         try:
-            result = self.indexer.index_document(
-                source_path=source_path,
-                content=markdown_content,
-                cache_path=cache_path,
+            if doc is not None:
+                chunks = chunk_document(
+                    doc=doc,
+                    source_path=source_path,
+                    source_url=source_url,
+                    content_hash=content_hash,
+                )
+            else:
+                chunks = chunk_text_fallback(
+                    text=markdown_content,
+                    source_path=source_path,
+                    source_url=source_url,
+                    content_hash=content_hash,
+                )
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Chunking failed: {e}")
+            self.progress.mark_extraction_failed()
+            return
+        
+        logger.debug(
+            f"[{_short_path(source_path)}] Chunked into {len(chunks)} chunks "
+            f"(chunker={chunks[0].metadata.get('chunker', '?') if chunks else '?'})"
+        )
+        
+        # --- Step 4: Index ---
+        try:
+            result = self.indexer.index_chunks(
+                chunks=chunks,
+                collection_name=collection_name,
+                force=self.config.force,
+                dry_run=dry_run,
                 file_size=file_size,
                 original_format=Path(source_path).suffix,
-                is_source_code=False,
+                cache_path=cache_path,
             )
             
             if result.status == "indexed":
                 self.progress.mark_indexed()
-                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection}")
+                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
             else:
@@ -942,45 +1103,87 @@ class GCSPipeline:
         cache_path = self.gcs_client.cache_path_for_source(source_path)
         file_size = len(content)
         
-        # Check if text-like (can be indexed directly) or needs docling
-        try:
-            text_content = content.decode('utf-8', errors='strict')
-            # Text file - index directly
-            markdown_content = text_content
-        except UnicodeDecodeError:
-            # Binary document (PDF, DOC, etc.) - needs docling
-            markdown_content = self._extract_with_docling(
-                source_path=source_path,
-                temp_path=extracted_path,
-                cache_path=cache_path,
-                dry_run=dry_run,
-            )
-            if markdown_content is None:
-                self.progress.mark_extraction_failed()
-                return
-        
-        # Index the markdown
-        if dry_run:
-            logger.info(f"[{_short_path(source_path)}] [DRY RUN] Would index archive doc")
-            self.progress.mark_indexed()
-            return
-        
         if not self.indexer:
             return
         
+        # Determine collection
+        collection_name = self.indexer.router.route_with_category(source_path, is_source_code=False)
+        
+        doc = None
+        markdown_content = None
+        
+        # Check if text-like (can be indexed directly) or needs docling
         try:
-            result = self.indexer.index_document(
-                source_path=source_path,
-                content=markdown_content,
-                cache_path=cache_path,
+            text_content = content.decode('utf-8', errors='strict')
+            markdown_content = text_content
+        except UnicodeDecodeError:
+            # Binary document (PDF, DOC, etc.) - extract DoclingDocument via docling
+            try:
+                doc = self.extractor.extract_to_document(extracted_path)
+                # Cache DoclingDocument JSON
+                if not dry_run:
+                    try:
+                        self.gcs_client.upload_docling_json(source_path, doc.model_dump_json())
+                    except Exception as e:
+                        logger.warning(f"[{_short_path(source_path)}] Failed to cache DoclingDocument: {e}")
+            except Exception as e:
+                logger.error(f"[{_short_path(source_path)}] Docling extraction failed: {e}")
+                self._log_error(source_path, f"Docling extraction failed: {e}")
+                self.progress.mark_extraction_failed()
+                return
+        
+        # Resolve source URL
+        source_url = resolve_source_url(source_path, content=markdown_content)
+        
+        # Compute content hash and get markdown
+        if doc is not None:
+            markdown_content = doc.export_to_markdown()
+            content_hash = get_content_hash(markdown_content)
+            # Cache markdown
+            if not dry_run:
+                try:
+                    self.gcs_client.upload_markdown(cache_path, markdown_content)
+                except Exception as e:
+                    logger.warning(f"[{_short_path(source_path)}] Failed to cache markdown: {e}")
+        else:
+            content_hash = get_content_hash(markdown_content)
+        
+        # Chunk
+        try:
+            if doc is not None:
+                chunks = chunk_document(
+                    doc=doc,
+                    source_path=source_path,
+                    source_url=source_url,
+                    content_hash=content_hash,
+                )
+            else:
+                chunks = chunk_text_fallback(
+                    text=markdown_content,
+                    source_path=source_path,
+                    source_url=source_url,
+                    content_hash=content_hash,
+                )
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Chunking failed: {e}")
+            self.progress.mark_extraction_failed()
+            return
+        
+        # Index
+        try:
+            result = self.indexer.index_chunks(
+                chunks=chunks,
+                collection_name=collection_name,
+                force=self.config.force,
+                dry_run=dry_run,
                 file_size=file_size,
                 original_format=Path(source_path).suffix,
-                is_source_code=False,
+                cache_path=cache_path,
             )
             
             if result.status == "indexed":
                 self.progress.mark_indexed()
-                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection}")
+                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
             else:
@@ -989,99 +1192,59 @@ class GCSPipeline:
             logger.error(f"[{_short_path(source_path)}] Indexing error: {e}")
             self.progress.mark_index_failed()
     
-    def _get_or_create_markdown(
+    def _extract_docling_document(
         self,
         source_path: str,
         content: bytes,
         blob: storage.Blob,
         cache_path: str,
         dry_run: bool = False,
-    ) -> Optional[str]:
-        """Get markdown content from cache or create via processing.
+    ):
+        """Extract a DoclingDocument from a binary blob.
+        
+        Downloads the blob to a temp file, runs docling extraction, caches
+        the DoclingDocument JSON and markdown to GCS.
         
         Args:
             source_path: GCS source path.
-            content: File content bytes.
+            content: File content bytes (unused except for context).
             blob: GCS Blob object.
             cache_path: GCS cache path for markdown.
             dry_run: If True, don't write to GCS cache.
         
         Returns:
-            Markdown content string, or None on failure.
+            DoclingDocument or None on failure.
         """
-        # Check GCS cache first
-        if not self.config.force and self.gcs_client.cache_exists_by_path(cache_path):
-            try:
-                cached_content = self.gcs_client.read_cached_markdown(cache_path)
-                logger.debug(f"[{_short_path(source_path)}] Using cached markdown")
-                return cached_content
-            except Exception as e:
-                logger.warning(f"[{_short_path(source_path)}] Failed to read cache: {e}")
-        
-        # Check if text file (no docling needed)
-        try:
-            text_content = content.decode('utf-8', errors='strict')
-            # Plain text - return directly (and cache)
-            if not dry_run:
-                try:
-                    self.gcs_client.upload_markdown(cache_path, text_content)
-                except Exception as e:
-                    logger.warning(f"[{_short_path(source_path)}] Failed to cache text: {e}")
-            return text_content
-        except UnicodeDecodeError:
-            pass  # Binary document, needs docling
-        
-        # Binary document - needs docling extraction
         temp_path = None
         try:
             temp_path = self.gcs_client.download_blob_to_temp(blob)
-            markdown = self._extract_with_docling(
-                source_path=source_path,
-                temp_path=temp_path,
-                cache_path=cache_path,
-                dry_run=dry_run,
-            )
-            return markdown
-        finally:
-            if temp_path and temp_path.exists():
-                temp_path.unlink(missing_ok=True)
-    
-    def _extract_with_docling(
-        self,
-        source_path: str,
-        temp_path: Path,
-        cache_path: str,
-        dry_run: bool = False,
-    ) -> Optional[str]:
-        """Extract markdown from binary document using docling.
-        
-        Args:
-            source_path: GCS source path.
-            temp_path: Path to temp file.
-            cache_path: GCS cache path.
-            dry_run: If True, don't write to GCS cache.
-        
-        Returns:
-            Markdown content, or None on failure.
-        """
-        try:
             start_time = time.time()
-            markdown = self.extractor.extract_to_markdown(temp_path)
+            doc = self.extractor.extract_to_document(temp_path)
             elapsed = time.time() - start_time
             logger.debug(f"[{_short_path(source_path)}] Docling extraction took {elapsed:.1f}s")
             
-            # Cache the result
+            # Cache DoclingDocument JSON
             if not dry_run:
                 try:
+                    self.gcs_client.upload_docling_json(source_path, doc.model_dump_json())
+                except Exception as e:
+                    logger.warning(f"[{_short_path(source_path)}] Failed to cache DoclingDocument JSON: {e}")
+                
+                # Also cache markdown
+                try:
+                    markdown = doc.export_to_markdown()
                     self.gcs_client.upload_markdown(cache_path, markdown)
                 except Exception as e:
                     logger.warning(f"[{_short_path(source_path)}] Failed to cache markdown: {e}")
             
-            return markdown
+            return doc
         except Exception as e:
             logger.error(f"[{_short_path(source_path)}] Docling extraction failed: {e}")
             self._log_error(source_path, f"Docling extraction failed: {e}")
             return None
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
     
     def _log_error(self, source_path: str, error: str) -> None:
         """Log error to file."""

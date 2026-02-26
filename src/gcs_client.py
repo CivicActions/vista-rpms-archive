@@ -311,3 +311,66 @@ class GCSClient:
             suffix = ".tar"
         
         return self.download_to_temp(source_path, suffix=suffix)
+
+    def docling_json_cache_path(self, source_path: str) -> str:
+        """Compute the cache path for a DoclingDocument JSON file.
+        
+        Args:
+            source_path: Relative path of source file (without bucket)
+        
+        Returns:
+            Full GCS path for cached DoclingDocument JSON file.
+        """
+        # Remove source prefix if present
+        if self._source_prefix and source_path.startswith(self._source_prefix):
+            relative_path = source_path[len(self._source_prefix):]
+        else:
+            relative_path = source_path
+        
+        return f"{self._cache_prefix}{relative_path}.docling.json"
+
+    def upload_docling_json(self, source_path: str, json_str: str) -> str:
+        """Upload serialized DoclingDocument JSON to GCS cache.
+        
+        Args:
+            source_path: GCS source path (used to derive cache path).
+            json_str: Serialized DoclingDocument JSON string.
+        
+        Returns:
+            GCS cache path of the uploaded JSON.
+        """
+        cache_path = self.docling_json_cache_path(source_path)
+        blob = self._cache_bucket.blob(cache_path)
+        blob.upload_from_string(
+            json_str,
+            content_type="application/json",
+        )
+        size_kb = len(json_str.encode("utf-8")) / 1024
+        if size_kb > 1024:
+            logger.info(f"Uploaded DoclingDocument JSON to {cache_path} ({size_kb/1024:.1f} MB)")
+        else:
+            logger.debug(f"Uploaded DoclingDocument JSON to {cache_path} ({size_kb:.1f} KB)")
+        return cache_path
+
+    def download_docling_json(self, source_path: str) -> str | None:
+        """Download cached DoclingDocument JSON from GCS.
+        
+        Args:
+            source_path: GCS source path (used to derive cache path).
+        
+        Returns:
+            JSON string if cache exists, None if not cached.
+        """
+        cache_path = self.docling_json_cache_path(source_path)
+        blob = self._cache_bucket.blob(cache_path)
+        try:
+            if not blob.exists(timeout=60):
+                return None
+            content = blob.download_as_text()
+            logger.debug(f"Read cached DoclingDocument JSON from {cache_path}")
+            return content
+        except NotFound:
+            return None
+        except GoogleCloudError as e:
+            logger.warning(f"Error reading DoclingDocument JSON cache for {source_path}: {e}")
+            return None

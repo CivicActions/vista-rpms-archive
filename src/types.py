@@ -144,6 +144,23 @@ class IndexingResult:
 
 
 @dataclass
+class ChunkResult:
+    """A single chunk produced by the chunking pipeline.
+    
+    Intermediate data structure passed from chunking to indexing.
+    """
+    
+    text: str  # Display text (for Qdrant "document" field)
+    embedding_text: str  # Contextualized text for embedding (may differ from display)
+    chunk_index: int  # 0-based position within the document
+    total_chunks: int  # Total chunks produced from this document
+    source_path: str  # GCS source path
+    source_url: str  # Reconstructed original web URL
+    content_hash: str  # SHA256 hash of full document content
+    metadata: dict = field(default_factory=dict)  # Chunker-specific metadata
+
+
+@dataclass
 class QdrantConfig:
     """Qdrant-specific configuration."""
     

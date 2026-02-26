@@ -7,6 +7,7 @@ from typing import Optional
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling_core.types import DoclingDocument
 from docling_core.types.doc import ImageRefMode
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,28 @@ class Extractor:
             Extracted content as markdown string
         """
         return self.extract_to_markdown(file_path)
+
+    def extract_to_document(self, file_path: Path) -> DoclingDocument:
+        """Extract document and return the full DoclingDocument object.
+        
+        Unlike extract_to_markdown(), this preserves the rich document
+        structure needed by HybridChunker for structure-aware chunking.
+        
+        Args:
+            file_path: Path to document file (PDF, DOCX, etc.)
+        
+        Returns:
+            DoclingDocument with full structural information.
+        
+        Raises:
+            Exception: If extraction fails.
+        """
+        logger.debug(f"Extracting to DoclingDocument: {file_path}")
+        
+        converter = self._get_converter()
+        result = converter.convert(str(file_path))
+        
+        return result.document
 
 
 def create_extractor(
