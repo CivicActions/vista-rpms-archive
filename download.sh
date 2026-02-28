@@ -12,4 +12,4 @@ gh repo list $ORG --limit 1000 --json name --jq '.[].name' | while read -r REPO;
     gh repo clone "$ORG/$REPO" "$REPO" -- --depth 1
 done
 git worktree add ../VistA-M-foia foia
-gsutil
+gsutil rsync -x ".*\.git.*" -r . gs://vista-rpms-archive/source
