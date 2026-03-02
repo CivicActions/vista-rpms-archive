@@ -189,6 +189,8 @@ class Config:
     # Extraction settings
     max_pages: int = 500
     max_file_size: int = 50 * 1024 * 1024  # 50MB
+    max_source_size: int = 10 * 1024 * 1024  # 10MB — skip source files larger than this (data dumps)
+    max_concurrent_large: int = 1  # max concurrent large (>32MB) file processing
     
     # Logging settings
     log_level: str = "INFO"

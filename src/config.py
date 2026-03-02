@@ -211,6 +211,8 @@ def merge_config(file_config: dict, args: argparse.Namespace) -> Config:
         # Extraction settings
         max_pages=args.max_pages if args.max_pages is not None else extraction.get("max_pages", 500),
         max_file_size=args.max_file_size if args.max_file_size is not None else extraction.get("max_file_size", 50 * 1024 * 1024),
+        max_source_size=extraction.get("max_source_size", 10 * 1024 * 1024),
+        max_concurrent_large=processing.get("max_concurrent_large", 1),
         
         # Logging settings
         log_level=args.log_level if args.log_level is not None else logging_cfg.get("level", "INFO"),

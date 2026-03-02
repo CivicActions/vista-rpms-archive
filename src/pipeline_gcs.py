@@ -225,6 +225,12 @@ class GCSPipeline:
         # Progress tracking
         self.progress = ProgressTracker()
         
+        # Semaphore to limit concurrent large-file processing (prevents OOM
+        # when multiple >32 MB files are downloaded & chunked simultaneously).
+        self._large_file_sem = threading.Semaphore(
+            config.max_concurrent_large if hasattr(config, 'max_concurrent_large') else 1
+        )
+        
         # Error log file
         self._error_file: Optional[Path] = None
         if config.error_file:
@@ -261,6 +267,11 @@ class GCSPipeline:
         """
         try:
             logger.info(f"Starting GCS pipeline run (dry_run={dry_run}, limit={limit}, parallel={parallel})")
+            logger.info(
+                f"Workers: {self.config.workers}, max_pending: {self.config.max_pending}, "
+                f"max_concurrent_large: {getattr(self.config, 'max_concurrent_large', 1)}, "
+                f"max_source_size: {getattr(self.config, 'max_source_size', 10*1024*1024) / 1024 / 1024:.0f} MB"
+            )
             _log_memory_usage()
             
             # Install crash handlers to diagnose OOM kills and other silent exits
@@ -529,7 +540,12 @@ class GCSPipeline:
                 f"[{_short_path(source_path)}] Large file "
                 f"({file_size / 1024 / 1024:.1f} MB), using temp file"
             )
-            self._process_large_blob(blob, source_path, file_size, dry_run=dry_run)
+            # Acquire semaphore to limit concurrent large-file memory usage
+            self._large_file_sem.acquire()
+            try:
+                self._process_large_blob(blob, source_path, file_size, dry_run=dry_run)
+            finally:
+                self._large_file_sem.release()
             self.progress.mark_processed()
             return
         
@@ -646,13 +662,32 @@ class GCSPipeline:
                 return
             
             if is_source_category(classification.category):
-                self._process_source_file(
+                # Guard: skip source files larger than max_source_size.
+                # Giant .zwr / data-dump files are not useful code for RAG and
+                # cause extreme memory amplification during chunking.
+                max_src = getattr(self.config, 'max_source_size', 10 * 1024 * 1024)
+                if file_size > max_src:
+                    logger.info(
+                        f"[{_short_path(source_path)}] Skipped — source file "
+                        f"({file_size / 1024 / 1024:.1f} MB) exceeds max_source_size "
+                        f"({max_src / 1024 / 1024:.0f} MB)"
+                    )
+                    self.progress.mark_skipped_binary()
+                    del text_content
+                    gc.collect()
+                    return
+                # Pass text directly to avoid encode→decode round-trip that
+                # triples memory for large files.
+                self._process_source_file_text(
                     source_path=source_path,
-                    content=text_content.encode('utf-8', errors='replace'),
+                    text_content=text_content,
                     classification=classification,
                     file_size=file_size,
                     dry_run=dry_run,
                 )
+                del text_content
+                gc.collect()
+                return
             else:
                 # Large doc file — extract DoclingDocument via temp path, chunk, index
                 cache_path = self.gcs_client.cache_path_for_source(source_path)
@@ -752,6 +787,12 @@ class GCSPipeline:
                 except Exception as e:
                     logger.error(f"[{_short_path(source_path)}] Indexing error: {e}")
                     self.progress.mark_index_failed()
+                finally:
+                    # Release large object references to help GC
+                    del chunks, markdown_content
+                    if doc is not None:
+                        del doc
+                    gc.collect()
         except Exception as e:
             logger.error(f"[{_short_path(source_path)}] Large file processing failed: {e}")
             self._log_error(source_path, f"Large file processing failed: {e}")
@@ -941,6 +982,80 @@ class GCSPipeline:
             logger.error(f"[{_short_path(source_path)}] Indexing error: {e}")
             self.progress.mark_index_failed()
     
+    def _process_source_file_text(
+        self,
+        source_path: str,
+        text_content: str,
+        classification: ClassificationResult,
+        file_size: int,
+        dry_run: bool = False,
+    ) -> None:
+        """Process a source code file from already-decoded text.
+
+        Same as _process_source_file but accepts a str instead of bytes
+        to avoid an encode→decode round-trip that triples peak memory for
+        large files coming through _process_large_blob.
+
+        Args:
+            source_path: GCS source path.
+            text_content: Already-decoded UTF-8 text content.
+            classification: Classification result.
+            file_size: File size in bytes.
+            dry_run: If True, don't write to Qdrant.
+        """
+        if not self.indexer:
+            logger.warning(f"[{_short_path(source_path)}] No indexer available")
+            return
+
+        # Resolve source URL (pass content for httrack comment detection)
+        source_url = resolve_source_url(source_path, content=text_content)
+        content_hash = get_content_hash(text_content)
+
+        # Determine collection
+        collection_name = self.indexer.router.route_with_category(source_path, is_source_code=True)
+
+        # Chunk using code-aware chunker
+        try:
+            chunks = chunk_source_code(
+                text=text_content,
+                source_path=source_path,
+                source_url=source_url,
+                content_hash=content_hash,
+            )
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Chunking failed: {e}")
+            self.progress.mark_extraction_failed()
+            return
+
+        logger.debug(
+            f"[{_short_path(source_path)}] Chunked into {len(chunks)} chunks "
+            f"(chunker={chunks[0].metadata.get('chunker', '?') if chunks else '?'})"
+        )
+
+        # Index chunks
+        try:
+            result = self.indexer.index_chunks(
+                chunks=chunks,
+                collection_name=collection_name,
+                force=self.config.force,
+                dry_run=dry_run,
+                file_size=file_size,
+                original_format=Path(source_path).suffix,
+                cache_path="",  # No cache for source files
+            )
+
+            if result.status == "indexed":
+                self.progress.mark_indexed()
+                logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+            elif result.status == "skipped":
+                self.progress.mark_skipped_indexed()
+            else:
+                self.progress.mark_index_failed()
+                logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
+        except Exception as e:
+            logger.error(f"[{_short_path(source_path)}] Indexing error: {e}")
+            self.progress.mark_index_failed()
+
     def _process_doc_file(
         self,
         blob: storage.Blob,
