@@ -2,11 +2,12 @@
 
 Provides three chunking strategies:
 - chunk_document(): Structure-aware chunking via Docling HybridChunker
-- chunk_source_code(): MUMPS label-boundary chunking
+- chunk_source_code(): MUMPS label-boundary chunking (for .m files)
 - chunk_text_fallback(): Token-window splitting at line boundaries
 """
 
 import logging
+import os
 import re
 
 from docling_core.transforms.chunker import HybridChunker
@@ -27,6 +28,17 @@ _MUMPS_LABEL_RE = re.compile(
     r"^(%?[A-Za-z][A-Za-z0-9]*)(?:\(([^)]*)\))?(?=[\s;(]|$)",
     re.MULTILINE,
 )
+
+# File extensions that should use MUMPS label-boundary chunking.
+# All other source files use the generic token-window fallback.
+_MUMPS_EXTENSIONS: frozenset[str] = frozenset({
+    ".m",      # Standard MUMPS routine
+    ".int",    # InterSystems intermediate routine
+    ".inc",    # MUMPS include file
+    ".zwr",    # GT.M/YottaDB global export
+    ".ro",     # Routine output format
+    "",        # No extension (common for MUMPS routines)
+})
 
 # Lazy-loaded tokenizer singleton (thread-safe after first creation)
 _tokenizer: HuggingFaceTokenizer | None = None
@@ -252,6 +264,13 @@ def chunk_source_code(
     """
     if not text.strip():
         return []
+
+    # Only apply MUMPS label-boundary chunking to MUMPS files.
+    # Other source files (Java, Python, XML, etc.) use token-window fallback.
+    ext = os.path.splitext(source_path)[1].lower()
+    if ext not in _MUMPS_EXTENSIONS:
+        logger.debug(f"[{source_path}] Non-MUMPS source ({ext}), using text-fallback")
+        return chunk_text_fallback(text, source_path, source_url, content_hash)
 
     lines = text.split("\n")
     matches = list(_MUMPS_LABEL_RE.finditer(text))
