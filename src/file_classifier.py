@@ -108,8 +108,11 @@ MUMPS_GLOBAL_PATTERNS = [
     re.compile(r'^\^[A-Z%][A-Z0-9]*\(0\)=', re.MULTILINE),
 ]
 
-# Binary MIME types that should be skipped (not text-indexable)
-BINARY_MIME_TYPES = frozenset({
+# MIME types for binary formats that Docling can extract text from.
+# These are routed to Docling for conversion instead of being skipped.
+# See: https://docling-project.github.io/docling/usage/supported_formats/
+DOCLING_MIME_TYPES = frozenset({
+    # Documents
     'application/pdf',
     'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -117,6 +120,19 @@ BINARY_MIME_TYPES = frozenset({
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'application/vnd.ms-powerpoint',
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    # HTML/XHTML
+    'text/html',
+    'application/xhtml+xml',
+    # Images (Docling OCR)
+    'image/png',
+    'image/jpeg',
+    'image/bmp',
+    'image/tiff',
+    'image/gif',
+})
+
+# Binary MIME types that should be skipped (not text-indexable)
+BINARY_MIME_TYPES = frozenset({
     'application/zip',
     'application/x-tar',
     'application/gzip',
@@ -124,12 +140,7 @@ BINARY_MIME_TYPES = frozenset({
     'application/x-7z-compressed',
     'application/x-rar-compressed',
     'application/octet-stream',
-    'image/png',
-    'image/jpeg',
-    'image/gif',
     'image/webp',
-    'image/bmp',
-    'image/tiff',
     'audio/mpeg',
     'audio/wav',
     'video/mp4',
@@ -142,7 +153,6 @@ BINARY_MIME_TYPES = frozenset({
 # Text MIME types that should be processed
 TEXT_MIME_TYPES = frozenset({
     'text/plain',
-    'text/html',
     'text/xml',
     'text/css',
     'text/javascript',
@@ -524,6 +534,15 @@ def classify_file(filepath: str, content: Optional[bytes] = None) -> Classificat
     # FIRST: Detect MIME type to catch mis-named files
     # This catches PDFs saved as .html, binaries with .tmp extension, etc.
     mime_type = detect_mime_type(content, filepath)
+
+    # If MIME indicates a Docling-extractable format, route as documentation
+    # so the pipeline sends it through Docling for text extraction.
+    if mime_type in DOCLING_MIME_TYPES:
+        ext = Path(filepath).suffix.lower()
+        return ClassificationResult(
+            category=FileCategory.DOCUMENTATION,
+            reason=f"Docling-extractable format ({mime_type}), extension: {ext}",
+        )
 
     # If MIME indicates binary regardless of extension, mark as binary
     if mime_type in BINARY_MIME_TYPES:
