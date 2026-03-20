@@ -194,6 +194,7 @@ class GCSPipeline:
         gcs_client: Optional[GCSClient] = None,
         extractor: Optional[Extractor] = None,
         indexer: Optional[QdrantIndexer] = None,
+        skip_list_path: Optional[Path] = None,
     ) -> None:
         """Initialize GCS pipeline.
         
@@ -202,6 +203,9 @@ class GCSPipeline:
             gcs_client: GCS client (created from config if not provided).
             extractor: Document extractor (created if not provided).
             indexer: Qdrant indexer (created if not provided).
+            skip_list_path: Optional path to a skip-list file. If provided,
+                paths listed in the file are skipped and newly completed
+                paths are appended for crash-safe resume.
         """
         self.config = config
         
@@ -235,7 +239,56 @@ class GCSPipeline:
         self._error_file: Optional[Path] = None
         if config.error_file:
             self._error_file = Path(config.error_file)
+        
+        # Skip list: paths to skip (already processed in a prior run) and
+        # file handle for appending newly completed paths.
+        self._skip_set: set[str] = set()
+        self._skip_list_path = skip_list_path
+        self._skip_list_lock = threading.Lock()
+        self._skip_list_fh = None
+        if skip_list_path:
+            self._load_skip_list(skip_list_path)
     
+    # -----------------------------------------------------------------
+    # Skip list helpers
+    # -----------------------------------------------------------------
+
+    def _load_skip_list(self, path: Path) -> None:
+        """Load skip list from file and open it for appending."""
+        if path.exists():
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        self._skip_set.add(line)
+            logger.info(f"Loaded {len(self._skip_set)} paths from skip list: {path}")
+        else:
+            logger.info(f"Skip list file does not exist yet, will create: {path}")
+        # Open for append so every completed path is persisted immediately
+        self._skip_list_fh = open(path, 'a')
+
+    def _in_skip_list(self, source_path: str) -> bool:
+        """Check whether *source_path* (prefix-stripped) is in the skip set."""
+        return _short_path(source_path) in self._skip_set
+
+    def _record_completed(self, source_path: str) -> None:
+        """Record a successfully processed path in the skip list.
+
+        Thread-safe; flushes to disk immediately for crash safety.
+        """
+        short = _short_path(source_path)
+        self._skip_set.add(short)
+        if self._skip_list_fh is not None:
+            with self._skip_list_lock:
+                self._skip_list_fh.write(short + '\n')
+                self._skip_list_fh.flush()
+
+    def _close_skip_list(self) -> None:
+        """Flush and close the skip list file handle."""
+        if self._skip_list_fh is not None:
+            self._skip_list_fh.close()
+            self._skip_list_fh = None
+
     @property
     def indexer(self) -> Optional[QdrantIndexer]:
         """Lazy-initialize Qdrant indexer on first access."""
@@ -343,6 +396,8 @@ class GCSPipeline:
         except Exception as e:
             logger.error(f"Pipeline run failed: {e}", exc_info=True)
             raise
+        finally:
+            self._close_skip_list()
     
     def _run_sequential(
         self,
@@ -500,6 +555,13 @@ class GCSPipeline:
             logger.debug(f"[{_short_path(source_path)}] Skipping legacy index.json")
             return
         
+        # Skip list check (before any GCS download or Qdrant call)
+        if self._in_skip_list(source_path):
+            logger.debug(f"[{_short_path(source_path)}] Skipped (in skip list)")
+            self.progress.mark_skipped_indexed()
+            self.progress.mark_processed()
+            return
+        
         # Check if already indexed in Qdrant (skip detection)
         # Route first to determine target collection, then check only that
         # collection instead of all collections (reduces HTTP requests from
@@ -571,12 +633,14 @@ class GCSPipeline:
             else:
                 logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
                 self.progress.mark_skipped_binary()
+                self._record_completed(source_path)
             self.progress.mark_processed()
             return
         
         if not is_indexable_category(classification.category):
             logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
             self.progress.mark_skipped_binary()
+            self._record_completed(source_path)
             self.progress.mark_processed()
             return
         
@@ -645,11 +709,13 @@ class GCSPipeline:
                 else:
                     logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
                     self.progress.mark_skipped_binary()
+                    self._record_completed(source_path)
                 return
             
             if not is_indexable_category(classification.category):
                 logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
                 self.progress.mark_skipped_binary()
+                self._record_completed(source_path)
                 return
             
             # Read full content from disk (not from GCS again)
@@ -673,6 +739,7 @@ class GCSPipeline:
                         f"({max_src / 1024 / 1024:.0f} MB)"
                     )
                     self.progress.mark_skipped_binary()
+                    self._record_completed(source_path)
                     del text_content
                     gc.collect()
                     return
@@ -779,8 +846,10 @@ class GCSPipeline:
                     if result.status == "indexed":
                         self.progress.mark_indexed()
                         logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+                        self._record_completed(source_path)
                     elif result.status == "skipped":
                         self.progress.mark_skipped_indexed()
+                        self._record_completed(source_path)
                     else:
                         self.progress.mark_index_failed()
                         logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
@@ -849,6 +918,12 @@ class GCSPipeline:
                 for rel_path, extracted_path, file_content in extractor.extract_all_files(temp_path):
                     # Construct full source path: archive_name/relative_path
                     full_source_path = f"{archive_path}/{rel_path}"
+                    
+                    # Skip list check (before Qdrant)
+                    if self._in_skip_list(full_source_path):
+                        logger.debug(f"[{_short_path(full_source_path)}] Skipped (in skip list)")
+                        self.progress.mark_skipped_indexed()
+                        continue
                     
                     # Check if already indexed — route first to avoid checking all collections
                     if not self.config.force and self.indexer:
@@ -973,8 +1048,10 @@ class GCSPipeline:
             if result.status == "indexed":
                 self.progress.mark_indexed()
                 logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+                self._record_completed(source_path)
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
+                self._record_completed(source_path)
             else:
                 self.progress.mark_index_failed()
                 logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
@@ -1047,8 +1124,10 @@ class GCSPipeline:
             if result.status == "indexed":
                 self.progress.mark_indexed()
                 logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+                self._record_completed(source_path)
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
+                self._record_completed(source_path)
             else:
                 self.progress.mark_index_failed()
                 logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
@@ -1189,8 +1268,10 @@ class GCSPipeline:
             if result.status == "indexed":
                 self.progress.mark_indexed()
                 logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+                self._record_completed(source_path)
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
+                self._record_completed(source_path)
             else:
                 self.progress.mark_index_failed()
                 logger.warning(f"[{_short_path(source_path)}] Index failed: {result.error}")
@@ -1299,8 +1380,10 @@ class GCSPipeline:
             if result.status == "indexed":
                 self.progress.mark_indexed()
                 logger.info(f"[{_short_path(source_path)}] Indexed to {result.collection} ({len(chunks)} chunks)")
+                self._record_completed(source_path)
             elif result.status == "skipped":
                 self.progress.mark_skipped_indexed()
+                self._record_completed(source_path)
             else:
                 self.progress.mark_index_failed()
         except Exception as e:

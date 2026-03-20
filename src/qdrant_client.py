@@ -188,6 +188,16 @@ class QdrantIndexer:
                         logger.debug(f"Collection '{collection_name}' was created by another worker")
                     else:
                         raise
+                # Ensure payload index on metadata.source_path for fast
+                # filter-based deletes (avoids O(n) full scans).
+                try:
+                    self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name="metadata.source_path",
+                        field_schema=models.PayloadSchemaType.KEYWORD,
+                    )
+                except Exception as idx_err:
+                    logger.warning(f"Payload index creation failed for '{collection_name}': {idx_err}")
                 self._collections_checked.add(collection_name)
             else:
                 raise

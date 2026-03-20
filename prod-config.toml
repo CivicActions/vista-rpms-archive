@@ -23,9 +23,6 @@ timeout = 600
 
 [extraction]
 max_pages = 20000
-# max_file_size applies to document extraction (PDFs, office docs).
-# 500 MB is generous for even the largest PDF compendia.
-max_file_size = 524288000
 # max_source_size caps source-code files sent through the chunker.
 # Giant .zwr global exports (64 MB+) are ICD data dumps, not useful code,
 # and cause extreme memory amplification during tokenisation/chunking.

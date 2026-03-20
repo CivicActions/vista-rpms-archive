@@ -130,6 +130,14 @@ Environment Variables:
         help="Maximum file size in bytes (default: 50MB)",
     )
     
+    # Skip list for resume support
+    parser.add_argument(
+        "--skip-list",
+        type=Path,
+        help="Path to skip-list file. Listed paths are skipped; "
+             "newly completed paths are appended for crash-safe resume.",
+    )
+    
     # Logging
     parser.add_argument(
         "--log-level",
@@ -196,10 +204,15 @@ def main() -> int:
         logger.info("FORCE mode - will re-index all files")
     if args.sequential:
         logger.info("SEQUENTIAL mode - processing one file at a time")
+    if args.skip_list:
+        logger.info(f"Skip list: {args.skip_list}")
     
     # Create and run pipeline
     try:
-        pipeline = GCSPipeline(config=config)
+        pipeline = GCSPipeline(
+            config=config,
+            skip_list_path=args.skip_list,
+        )
         
         # Connect console handler to progress tracker for periodic summaries
         console_handler.set_progress_tracker(pipeline.progress)
