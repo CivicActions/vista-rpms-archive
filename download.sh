@@ -11,10 +11,11 @@ httrack --update -c 3 -T 90 -R 9 \
 'http://worldvista.org' \
 'https://hardhats.org' \
 'https://www.va.gov/vdl/documents/Monograph/Monograph/vista_monograph_0723_r.docx' \
-'https://vistapedia.com/' \
-'https://journal.worldvista.org/' \
-'https://education.worldvista.org/'
+'https://vistapedia.com/'
 wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://code.worldvista.org/
+wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://resources.worldvista.org/
+wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://journal.worldvista.org/
+wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait https://education.worldvista.org/
 wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://foia-vista.worldvista.org
 ORG=WorldVistA
 mkdir /data/source/$ORG
