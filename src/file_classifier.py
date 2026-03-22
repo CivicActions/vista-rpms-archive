@@ -129,6 +129,23 @@ DOCLING_MIME_TYPES = frozenset({
     'image/bmp',
     'image/tiff',
     'image/gif',
+    'image/webp',
+    # Audio (Docling ASR via Whisper)
+    'audio/mpeg',          # MP3
+    'audio/wav',           # WAV
+    'audio/x-wav',         # WAV alternate
+    'audio/mp4',           # M4A
+    'audio/x-m4a',         # M4A alternate
+    'audio/aac',           # AAC
+    'audio/ogg',           # OGG
+    'audio/flac',          # FLAC
+    # Video (Docling ASR — audio track extraction via ffmpeg)
+    'video/mp4',           # MP4
+    'video/mpeg',          # MPEG
+    'video/x-msvideo',     # AVI
+    'video/quicktime',     # MOV
+    # Other
+    'text/vtt',            # WebVTT
 })
 
 # Binary MIME types that should be skipped (not text-indexable)
@@ -140,11 +157,6 @@ BINARY_MIME_TYPES = frozenset({
     'application/x-7z-compressed',
     'application/x-rar-compressed',
     'application/octet-stream',
-    'image/webp',
-    'audio/mpeg',
-    'audio/wav',
-    'video/mp4',
-    'video/mpeg',
     'application/x-executable',
     'application/x-sharedlib',
     'application/x-mach-binary',
