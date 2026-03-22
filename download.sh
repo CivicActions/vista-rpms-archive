@@ -5,6 +5,7 @@ cd /data/source
 # Download major complex sites with HTTrack, which has better crawling
 httrack --update -c 3 -T 90 -R 9 \
 '-*worldvista.org/*/view' '-*worldvista.org/*/download' \
+'-*ihs.gov/rpms/applications/ftp/*' \
 'https://opensourcevista.net/NancysVistAServer/' \
 'https://www.va.gov/vdl/' \
 'https://www.ihs.gov/rpms/' \
@@ -20,6 +21,8 @@ wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait
 wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://journal.worldvista.org/
 wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait https://education.worldvista.org/
 wget2 --mirror --page-requisites --no-parent --robots=off --wait=1 --random-wait --reject-regex '\?C=|\?O=' https://foia-vista.worldvista.org
+# Download IHS RPMS FTP (dynamic file browser - requires custom crawler)
+python download-ihs-ftp.py --resume
 # Download VistApedia
 python download-vistapedia.py
 # Download the GitHub repositories
