@@ -8,6 +8,8 @@ httrack --update -c 3 -T 90 -R 9 \
 'https://www.va.gov/vdl/' \
 'https://www.ihs.gov/rpms/' \
 'https://www.ihs.gov/sites/RPMS/SRCB/' \
+'https://www.ihs.gov/cis/' \
+'https://www.ihs.gov/sites/cis/themes/' \
 'http://worldvista.org' \
 'https://hardhats.org' \
 'https://www.va.gov/vdl/documents/Monograph/Monograph/vista_monograph_0723_r.docx' \
