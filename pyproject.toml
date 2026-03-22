@@ -5,7 +5,7 @@ description = "Document extraction pipeline for Vista RPMS Archive - extracts of
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "docling>=2.0.0",
+    "docling[asr]>=2.0.0",
     "docling-core[chunking]",
     "google-cloud-storage>=2.0.0",
     "qdrant-client[fastembed]>=1.12.0",
