@@ -125,10 +125,14 @@ def parse_directory(page_html: str) -> tuple[list[dict], list[dict]]:
             qs = urllib.parse.parse_qs(href.lstrip("?"))
             path = qs.get("p", [""])[0]
             fname = qs.get("flname", [filename.strip()])[0]
+            # Re-encode URL to handle spaces and other special chars
+            url = (BASE_URL + "?"
+                   + urllib.parse.urlencode(
+                       {"p": path, "flname": fname, "download": "1"}))
             files.append({
                 "path": path,
                 "filename": fname,
-                "url": BASE_URL + href,
+                "url": url,
             })
 
     return dirs, files
@@ -189,6 +193,7 @@ def main():
 Examples:
   %(prog)s --dry-run                  # List files without downloading
   %(prog)s --resume                   # Download, skipping existing files
+  %(prog)s --retry-errors FILE        # Retry only files from error log
   %(prog)s --delay 1                  # Slower rate limiting
 """,
     )
@@ -213,6 +218,10 @@ Examples:
         "--verbose", action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--retry-errors", metavar="FILE",
+        help="Retry downloading only the files listed in an error log",
+    )
 
     args = parser.parse_args()
 
@@ -223,10 +232,33 @@ Examples:
         datefmt="%H:%M:%S",
     )
 
-    # Phase 1: Crawl the directory tree
-    log.info("=== Phase 1: Crawling directory tree ===")
-    all_files = crawl_directory("", "", args.delay)
-    log.info("Total files found: %d", len(all_files))
+    if args.retry_errors:
+        # Retry mode: read paths from error log, reconstruct URLs
+        log.info("=== Retry mode: reading %s ===", args.retry_errors)
+        all_files = []
+        with open(args.retry_errors, encoding="utf-8") as ef:
+            for line in ef:
+                local_rel = line.strip()
+                if not local_rel:
+                    continue
+                # Reconstruct the backslash-separated FTP path
+                ftp_path = "rpms\\" + local_rel.replace("/", "\\")
+                fname = os.path.basename(local_rel)
+                url = (BASE_URL + "?"
+                       + urllib.parse.urlencode(
+                           {"p": ftp_path, "flname": fname,
+                            "download": "1"}))
+                all_files.append({
+                    "path": ftp_path,
+                    "filename": fname,
+                    "url": url,
+                })
+        log.info("Files to retry: %d", len(all_files))
+    else:
+        # Phase 1: Crawl the directory tree
+        log.info("=== Phase 1: Crawling directory tree ===")
+        all_files = crawl_directory("", "", args.delay)
+        log.info("Total files found: %d", len(all_files))
 
     if args.dry_run:
         log.info("=== Dry-run: files that would be downloaded ===")
