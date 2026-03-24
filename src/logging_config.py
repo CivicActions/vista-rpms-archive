@@ -185,6 +185,7 @@ def setup_logging(
     
     # Reduce noise from third-party libraries
     logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('google.auth').setLevel(logging.WARNING)
     logging.getLogger('google.cloud').setLevel(logging.WARNING)

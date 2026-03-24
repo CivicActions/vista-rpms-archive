@@ -34,5 +34,17 @@ gh repo list $ORG --limit 1000 --json name --jq '.[].name' | while read -r REPO;
 done
 # Add a worktree for the FOIA branch, since that has some unique code
 git worktree add ../VistA-M-foia foia
+
+# Rename any files with non-printable characters to avoid issues with Google Cloud Storage
+cd /data/source
+find . -depth -name $'*[\x01-\x1f\x7f]*' -print0 | while IFS= read -r -d '' f; do
+    dir="$(dirname "$f")"
+    old="$(basename "$f")"
+    new="$(printf '%s' "$old" | tr -d '\001-\037\177')"
+    if [[ -n "$new" && "$old" != "$new" ]]; then
+        mv -v "$dir/$old" "$dir/$new"
+    fi
+done
+
 # Store everyting in Google Cloud Storage
 gsutil rsync -x ".*\.git.*" -r . gs://vista-rpms-archive/source

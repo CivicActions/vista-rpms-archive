@@ -98,6 +98,7 @@ class ProgressTracker:
     total_blobs: int = 0
     processed: int = 0
     skipped_indexed: int = 0  # Already in Qdrant
+    skipped_skip_list: int = 0  # In skip list file
     skipped_binary: int = 0   # Binary files
     skipped_cached: int = 0   # Cached but not indexed (shouldn't happen in new arch)
     indexed: int = 0
@@ -117,6 +118,11 @@ class ProgressTracker:
         """Mark a file as skipped (already indexed in Qdrant)."""
         with self._lock:
             self.skipped_indexed += 1
+    
+    def mark_skipped_skip_list(self) -> None:
+        """Mark a file as skipped (in skip list file)."""
+        with self._lock:
+            self.skipped_skip_list += 1
     
     def mark_skipped_binary(self) -> None:
         """Mark a file as skipped (binary/unprocessable)."""
@@ -152,6 +158,7 @@ class ProgressTracker:
             return (
                 f"[{self.processed}/{self.total_blobs}] "
                 f"indexed={self.indexed} skip_indexed={self.skipped_indexed} "
+                f"skip_list={self.skipped_skip_list} "
                 f"skip_binary={self.skipped_binary} "
                 f"idx_fail={self.index_failed} ext_fail={self.extraction_failed} "
                 f"archives={self.archives_processed} "
@@ -170,6 +177,7 @@ class ProgressTracker:
                 f"Files processed:          {self.processed}\n"
                 f"Successfully indexed:     {self.indexed}\n"
                 f"Skipped (already indexed):{self.skipped_indexed}\n"
+                f"Skipped (skip list):      {self.skipped_skip_list}\n"
                 f"Skipped (binary/other):   {self.skipped_binary}\n"
                 f"Index failures:           {self.index_failed}\n"
                 f"Extraction failures:      {self.extraction_failed}\n"
@@ -557,8 +565,8 @@ class GCSPipeline:
         
         # Skip list check (before any GCS download or Qdrant call)
         if self._in_skip_list(source_path):
-            logger.debug(f"[{_short_path(source_path)}] Skipped (in skip list)")
-            self.progress.mark_skipped_indexed()
+            logger.info(f"[{_short_path(source_path)}] Skipped (in skip list)")
+            self.progress.mark_skipped_skip_list()
             self.progress.mark_processed()
             return
         
@@ -921,8 +929,8 @@ class GCSPipeline:
                     
                     # Skip list check (before Qdrant)
                     if self._in_skip_list(full_source_path):
-                        logger.debug(f"[{_short_path(full_source_path)}] Skipped (in skip list)")
-                        self.progress.mark_skipped_indexed()
+                        logger.info(f"[{_short_path(full_source_path)}] Skipped (in skip list)")
+                        self.progress.mark_skipped_skip_list()
                         continue
                     
                     # Check if already indexed — route first to avoid checking all collections
