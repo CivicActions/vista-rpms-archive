@@ -279,6 +279,22 @@ class GCSPipeline:
         """Check whether *source_path* (prefix-stripped) is in the skip set."""
         return _short_path(source_path) in self._skip_set
 
+    def _skip_fast(self, source_path: str) -> bool:
+        """Cheap pre-filter: skip directories, index.json, and skip-list items.
+
+        Returns True if the blob should be skipped entirely (no thread
+        dispatch, no gc.collect, no Qdrant call).
+        """
+        if source_path.endswith('/'):
+            return True
+        if source_path.endswith('index.json'):
+            return True
+        if self._in_skip_list(source_path):
+            self.progress.mark_skipped_skip_list()
+            self.progress.mark_processed()
+            return True
+        return False
+
     def _record_completed(self, source_path: str) -> None:
         """Record a successfully processed path in the skip list.
 
@@ -419,6 +435,10 @@ class GCSPipeline:
             dry_run: If True, don't write to Qdrant or GCS cache.
         """
         for i, blob in enumerate(blobs):
+            # Fast skip-list pre-filter (avoids thread dispatch + gc.collect overhead)
+            if self._skip_fast(blob.name):
+                continue
+
             try:
                 self._process_blob(blob, dry_run=dry_run)
             except Exception as e:
@@ -461,6 +481,9 @@ class GCSPipeline:
                 
                 # Submit initial batch up to max_pending
                 for blob in blob_iter:
+                    # Fast skip-list pre-filter (avoids thread dispatch + gc overhead)
+                    if self._skip_fast(blob.name):
+                        continue
                     if len(pending) >= max_pending:
                         break
                     future = executor.submit(self._process_blob_with_error_handling, blob, dry_run)
@@ -499,6 +522,9 @@ class GCSPipeline:
                     
                     # Submit more tasks up to max_pending
                     for blob in blob_iter:
+                        # Fast skip-list pre-filter
+                        if self._skip_fast(blob.name):
+                            continue
                         if len(pending) >= max_pending:
                             break
                         future = executor.submit(self._process_blob_with_error_handling, blob, dry_run)
@@ -563,9 +589,9 @@ class GCSPipeline:
             logger.debug(f"[{_short_path(source_path)}] Skipping legacy index.json")
             return
         
-        # Skip list check (before any GCS download or Qdrant call)
+        # Skip list check (safety net — normally filtered by _skip_fast before dispatch)
         if self._in_skip_list(source_path):
-            logger.info(f"[{_short_path(source_path)}] Skipped (in skip list)")
+            logger.debug(f"[{_short_path(source_path)}] Skipped (in skip list)")
             self.progress.mark_skipped_skip_list()
             self.progress.mark_processed()
             return
