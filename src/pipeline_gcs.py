@@ -27,6 +27,7 @@ from .file_classifier import (
     ClassificationResult,
     FileCategory,
     classify_file,
+    detect_image_mime,
     is_indexable_category,
     is_source_category,
 )
@@ -45,18 +46,128 @@ def _short_path(path: str) -> str:
     return path
 
 
+def _get_rss_gb() -> float:
+    """Return current process RSS in GB, or 0.0 on error."""
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
 def _log_memory_usage() -> None:
-    """Log current memory usage."""
+    """Log current memory usage at INFO level."""
     try:
         process = psutil.Process(os.getpid())
         mem_info = process.memory_info()
         mem_percent = process.memory_percent()
-        logger.debug(
+        logger.info(
             f"Memory usage: {mem_info.rss / 1024 / 1024:.1f} MB "
             f"({mem_percent:.1f}% of system)"
         )
     except Exception:
         pass  # psutil not available or error
+
+
+def _force_malloc_trim() -> None:
+    """Ask glibc to return freed native memory to the OS.
+
+    Python's pymalloc and C libraries (ONNX, httpx, libpdfium) allocate
+    through glibc malloc.  By default glibc hoards freed pages for reuse,
+    which shows up as ever-growing RSS even when Python objects have been
+    collected.  ``malloc_trim(0)`` forces glibc to release as many pages
+    as it can via ``madvise(MADV_DONTNEED)``.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _rss_mb() -> int:
+    """Return current process RSS in MB."""
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+class _RSSMonitor:
+    """Background thread that logs RSS every N seconds.
+    
+    Helps pinpoint exactly WHEN memory explosions occur,
+    even during blocking operations (semaphore waits, proc.wait(), etc.).
+    """
+    
+    def __init__(self, interval: float = 5.0):
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_mb = 0
+    
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="rss-monitor")
+        self._thread.start()
+    
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+    
+    @staticmethod
+    def _top_anon_maps(n: int = 5) -> str:
+        """Return the top N anonymous memory regions by RSS from /proc/self/smaps."""
+        try:
+            regions = []
+            with open("/proc/self/smaps") as f:
+                addr = ""
+                rss_kb = 0
+                anon_kb = 0
+                for line in f:
+                    if line[0] != ' ' and '-' in line[:20]:
+                        if addr and rss_kb > 102400:  # > 100 MB
+                            regions.append((rss_kb, anon_kb, addr.strip()))
+                        parts = line.split()
+                        addr = parts[0]
+                        rss_kb = 0
+                        anon_kb = 0
+                    elif line.startswith("Rss:"):
+                        rss_kb = int(line.split()[1])
+                    elif line.startswith("Anonymous:"):
+                        anon_kb = int(line.split()[1])
+            if addr and rss_kb > 102400:
+                regions.append((rss_kb, anon_kb, addr.strip()))
+            regions.sort(reverse=True)
+            parts = []
+            for rss_kb, anon_kb, addr in regions[:n]:
+                parts.append(f"{addr} RSS={rss_kb//1024}MB anon={anon_kb//1024}MB")
+            return "; ".join(parts) if parts else "no large regions"
+        except Exception as e:
+            return f"error: {e}"
+
+    def _run(self):
+        snapshot_taken = False
+        while not self._stop.is_set():
+            mb = _rss_mb()
+            delta = mb - self._last_mb if self._last_mb else 0
+            # Log every time if RSS > 5 GB, or if delta > 500 MB
+            if mb > 5000 or abs(delta) > 500:
+                # Get active thread names for context
+                active = [t.name for t in threading.enumerate()
+                          if t.is_alive() and t.name not in ("MainThread", "rss-monitor")]
+                logger.warning(
+                    f"RSS monitor: {mb} MB (delta={delta:+d} MB), "
+                    f"threads={len(active)}: {', '.join(active[:8])}"
+                )
+                # Dump top anon maps when RSS crosses 10 GB for the first time,
+                # then again every 20 GB to see growth pattern
+                if mb > 10000 and (not snapshot_taken or delta > 20000):
+                    maps_info = self._top_anon_maps(10)
+                    logger.warning(f"RSS top anon maps: {maps_info}")
+                    snapshot_taken = True
+            self._last_mb = mb
+            self._stop.wait(self._interval)
 
 
 def _install_crash_handlers() -> None:
@@ -100,6 +211,7 @@ class ProgressTracker:
     skipped_indexed: int = 0  # Already in Qdrant
     skipped_skip_list: int = 0  # In skip list file
     skipped_binary: int = 0   # Binary files
+    skipped_small_image: int = 0  # Images below min_image_docling_size
     skipped_cached: int = 0   # Cached but not indexed (shouldn't happen in new arch)
     indexed: int = 0
     index_failed: int = 0
@@ -128,6 +240,11 @@ class ProgressTracker:
         """Mark a file as skipped (binary/unprocessable)."""
         with self._lock:
             self.skipped_binary += 1
+    
+    def mark_skipped_small_image(self) -> None:
+        """Mark a file as skipped (image below min_image_docling_size)."""
+        with self._lock:
+            self.skipped_small_image += 1
     
     def mark_indexed(self) -> None:
         """Mark a file as successfully indexed."""
@@ -160,6 +277,7 @@ class ProgressTracker:
                 f"indexed={self.indexed} skip_indexed={self.skipped_indexed} "
                 f"skip_list={self.skipped_skip_list} "
                 f"skip_binary={self.skipped_binary} "
+                f"skip_small_img={self.skipped_small_image} "
                 f"idx_fail={self.index_failed} ext_fail={self.extraction_failed} "
                 f"archives={self.archives_processed} "
                 f"({rate:.1f} files/sec)"
@@ -179,6 +297,7 @@ class ProgressTracker:
                 f"Skipped (already indexed):{self.skipped_indexed}\n"
                 f"Skipped (skip list):      {self.skipped_skip_list}\n"
                 f"Skipped (binary/other):   {self.skipped_binary}\n"
+                f"Skipped (small images):   {self.skipped_small_image}\n"
                 f"Index failures:           {self.index_failed}\n"
                 f"Extraction failures:      {self.extraction_failed}\n"
                 f"Archives processed:       {self.archives_processed}\n"
@@ -225,10 +344,13 @@ class GCSPipeline:
             cache_prefix=config.cache_prefix,
         )
         
-        # Initialize extractor (for docling conversion)
+        # Initialize extractor (for docling conversion — runs in subprocesses)
         self.extractor = extractor or create_extractor(
             max_pages=config.max_pages,
             do_ocr=False,
+            recycle_after=getattr(config, 'docling_recycle_after', 50),
+            max_concurrent=getattr(config, 'max_concurrent_docling', 2),
+            conversion_timeout=getattr(config, 'docling_conversion_timeout', 600),
         )
         
         # Initialize Qdrant indexer
@@ -313,6 +435,18 @@ class GCSPipeline:
             self._skip_list_fh.close()
             self._skip_list_fh = None
 
+    def _is_small_image(self, content: bytes, source_path: str) -> bool:
+        """Return True if *content* is an image file below the docling size threshold.
+
+        Tiny images (icons, sprites, UI theme assets) waste significant memory
+        when run through docling OCR and almost never produce useful chunks.
+        """
+        min_size = getattr(self.config, 'min_image_docling_size', 50 * 1024)
+        if len(content) >= min_size:
+            return False
+        mime = detect_image_mime(content[:8192], source_path)
+        return mime is not None
+
     @property
     def indexer(self) -> Optional[QdrantIndexer]:
         """Lazy-initialize Qdrant indexer on first access."""
@@ -347,9 +481,16 @@ class GCSPipeline:
             logger.info(
                 f"Workers: {self.config.workers}, max_pending: {self.config.max_pending}, "
                 f"max_concurrent_large: {getattr(self.config, 'max_concurrent_large', 1)}, "
-                f"max_source_size: {getattr(self.config, 'max_source_size', 10*1024*1024) / 1024 / 1024:.0f} MB"
+                f"max_concurrent_docling: {getattr(self.config, 'max_concurrent_docling', 4)}, "
+                f"max_source_size: {getattr(self.config, 'max_source_size', 10*1024*1024) / 1024 / 1024:.0f} MB, "
+                f"docling_recycle_after: {getattr(self.config, 'docling_recycle_after', 10)}, "
+                f"min_image_docling_size: {getattr(self.config, 'min_image_docling_size', 50*1024) / 1024:.0f} KB"
             )
             _log_memory_usage()
+            
+            # Start background RSS monitor for diagnostics
+            rss_monitor = _RSSMonitor(interval=5.0)
+            rss_monitor.start()
             
             # Install crash handlers to diagnose OOM kills and other silent exits
             crash_state = _install_crash_handlers()
@@ -512,10 +653,10 @@ class GCSPipeline:
                             logger.info(self.progress.get_progress_str())
                             _log_memory_usage()
                         
-                        # Run garbage collection periodically
-                        if done_count % 500 == 0:
-                            logger.debug("Running garbage collection...")
+                        # Run garbage collection + malloc_trim periodically
+                        if done_count % 50 == 0:
                             gc.collect()
+                            _force_malloc_trim()
                             _log_memory_usage()
                     
                     logger.debug(f"Tasks completed: {done_count}, pending: {len(pending)}")
@@ -662,7 +803,7 @@ class GCSPipeline:
         # Handle based on category
         if classification.category == FileCategory.BINARY:
             # Check if it's an archive (ZIP/TAR) - these are "binary" but contain files
-            if self._is_archive_mime(content):
+            if self._is_archive_mime(content, source_path):
                 self._process_archive(blob, content, source_path, dry_run=dry_run)
             else:
                 logger.info(f"[{_short_path(source_path)}] Skipped ({classification.reason})")
@@ -680,12 +821,30 @@ class GCSPipeline:
         
         # Process the file based on category
         if is_source_category(classification.category):
+            # Guard: skip source files larger than max_source_size.
+            # Giant .zwr / data-dump files cause extreme memory amplification
+            # during chunking/embedding (30 MB text → thousands of chunks →
+            # batch embed can use 10+ GB).
+            max_src = getattr(self.config, 'max_source_size', 10 * 1024 * 1024)
+            file_size = blob.size or len(content)
+            if file_size > max_src:
+                logger.info(
+                    f"[{_short_path(source_path)}] Skipped — source file "
+                    f"({file_size / 1024 / 1024:.1f} MB) exceeds max_source_size "
+                    f"({max_src / 1024 / 1024:.0f} MB)"
+                )
+                self.progress.mark_skipped_binary()
+                self._record_completed(source_path)
+                del content
+                self.progress.mark_processed()
+                return
+
             # Source code - index directly without docling
             self._process_source_file(
                 source_path=source_path,
                 content=content,
                 classification=classification,
-                file_size=blob.size or len(content),
+                file_size=file_size,
                 dry_run=dry_run,
             )
         else:
@@ -734,7 +893,7 @@ class GCSPipeline:
             )
             
             if classification.category == FileCategory.BINARY:
-                if self._is_archive_mime(header):
+                if self._is_archive_mime(header, source_path):
                     # Re-read full content for archive processing
                     with open(temp_path, 'rb') as f:
                         content = f.read()
@@ -817,6 +976,22 @@ class GCSPipeline:
                     pass
                 
                 if markdown_content is None:
+                    # Skip tiny images from docling — they waste memory.
+                    # (Unlikely for large blobs, but defensive.)
+                    min_img_size = getattr(self.config, 'min_image_docling_size', 50 * 1024)
+                    if file_size < min_img_size:
+                        with open(temp_path, 'rb') as f:
+                            header_bytes = f.read(8192)
+                        if detect_image_mime(header_bytes, source_path) is not None:
+                            logger.debug(
+                                f"[{_short_path(source_path)}] Skipped — image too small for docling OCR"
+                            )
+                            self.progress.mark_skipped_small_image()
+                            self._record_completed(source_path)
+                            del text_content
+                            gc.collect()
+                            return
+
                     # Binary doc — extract with docling
                     try:
                         start_time = time.time()
@@ -904,14 +1079,30 @@ class GCSPipeline:
             if temp_path and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
 
-    def _is_archive_mime(self, content: bytes) -> bool:
-        """Check if content is an archive by magic bytes."""
+    # Extensions that use ZIP container format but should NOT be
+    # extracted as archives (Java archives, Android packages, etc.).
+    _SKIP_ARCHIVE_EXTENSIONS = frozenset({
+        '.jar', '.war', '.ear',  # Java archives
+        '.apk', '.aab',          # Android packages
+        '.whl', '.egg',          # Python packages
+    })
+
+    def _is_archive_mime(self, content: bytes, source_path: str = "") -> bool:
+        """Check if content is an archive by magic bytes.
+
+        Returns False for ZIP-based containers that should be skipped
+        (JAR, WAR, APK, etc.) even though they share the ZIP magic bytes.
+        """
         # ZIP magic: PK\x03\x04
         if content.startswith(b'PK\x03\x04'):
-            # But exclude Office documents (DOCX, XLSX, PPTX)
-            # They also start with PK but contain specific signatures
+            # Exclude Office documents (DOCX, XLSX, PPTX)
             if b'word/' in content[:2000] or b'xl/' in content[:2000] or b'ppt/' in content[:2000]:
                 return False
+            # Exclude non-archive ZIP containers (.jar, .war, .apk, etc.)
+            if source_path:
+                ext = source_path[source_path.rfind('.'):].lower() if '.' in source_path else ''
+                if ext in self._SKIP_ARCHIVE_EXTENSIONS:
+                    return False
             return True
         
         # TAR magic: various
@@ -933,6 +1124,17 @@ class GCSPipeline:
     ) -> None:
         """Process an archive file by extracting and processing its contents.
         
+        Applies memory-safety guards to prevent OOM when an archive contains
+        thousands of files (e.g. GOLD.zip with 5765 DESCRIBE TYPE*.json):
+        
+        - ``max_archive_members`` logs a warning when an archive exceeds this
+          many files (all files are still processed).
+        - ``max_source_size`` is enforced for source-code members.
+        - ``gc.collect()`` runs every 50 members to reclaim native memory.
+        - Each extracted temp file is deleted immediately after processing.
+        - The in-memory archive bytes are written to temp instead of
+          re-downloading from GCS.
+        
         Args:
             blob: GCS Blob of the archive.
             content: Archive content bytes.
@@ -941,22 +1143,69 @@ class GCSPipeline:
         """
         logger.info(f"[{_short_path(archive_path)}] Processing archive")
         
-        # Download archive to temp file for extraction
+        max_members = getattr(self.config, 'max_archive_members', 2000)
+        max_src = getattr(self.config, 'max_source_size', 10 * 1024 * 1024)
+        
+        # Write archive bytes to a temp file from memory (avoids redundant
+        # GCS download — ``content`` is already in RAM).
         temp_path = None
         extracted_count = 0
+        member_count = 0
         
         try:
-            temp_path = self.gcs_client.download_blob_to_temp(blob)
+            import tempfile as _tempfile
+            suffix = None
+            if "." in archive_path:
+                suffix = "." + archive_path.rsplit(".", 1)[-1]
+            fd = _tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="archive_")
+            temp_path = Path(fd.name)
+            fd.write(content)
+            fd.close()
+
+            # Release the in-memory archive bytes now that they're on disk.
+            del content
             
             with ArchiveExtractor() as extractor:
                 for rel_path, extracted_path, file_content in extractor.extract_all_files(temp_path):
+                    member_count += 1
+
+                    # --- warn if archive is unusually large ---
+                    if member_count == max_members:
+                        logger.warning(
+                            f"[{_short_path(archive_path)}] Large archive: "
+                            f"reached {max_members} members (max_archive_members "
+                            f"threshold) — continuing to process all files"
+                        )
+
+                    # --- periodic memory management (every 10 members) ---
+                    if member_count % 10 == 0:
+                        gc.collect()
+                        _force_malloc_trim()
+                        rss_gb = _get_rss_gb()
+                        logger.info(
+                            f"[{_short_path(archive_path)}] Archive progress: "
+                            f"{member_count} members, {extracted_count} indexed, "
+                            f"RSS={rss_gb:.1f} GB"
+                        )
+                        # Circuit breaker: abort archive if RSS exceeds ceiling
+                        max_rss = getattr(self.config, 'max_rss_gb', 0)
+                        if max_rss > 0 and rss_gb > max_rss:
+                            logger.critical(
+                                f"[{_short_path(archive_path)}] RSS {rss_gb:.1f} GB "
+                                f"exceeds max_rss_gb={max_rss} GB — aborting archive "
+                                f"to prevent OOM (processed {extracted_count}/{member_count} members)"
+                            )
+                            self._cleanup_extracted_file(extracted_path)
+                            break
+
                     # Construct full source path: archive_name/relative_path
                     full_source_path = f"{archive_path}/{rel_path}"
                     
                     # Skip list check (before Qdrant)
                     if self._in_skip_list(full_source_path):
-                        logger.info(f"[{_short_path(full_source_path)}] Skipped (in skip list)")
+                        logger.debug(f"[{_short_path(full_source_path)}] Skipped (in skip list)")
                         self.progress.mark_skipped_skip_list()
+                        self._cleanup_extracted_file(extracted_path)
                         continue
                     
                     # Check if already indexed — route first to avoid checking all collections
@@ -970,6 +1219,7 @@ class GCSPipeline:
                         if exists:
                             logger.debug(f"[{_short_path(full_source_path)}] Skipped (indexed)")
                             self.progress.mark_skipped_indexed()
+                            self._cleanup_extracted_file(extracted_path)
                             continue
                     
                     # Classify the extracted file
@@ -977,15 +1227,31 @@ class GCSPipeline:
                     
                     if not is_indexable_category(classification.category):
                         logger.debug(f"[{_short_path(full_source_path)}] Skipped (non-indexable)")
+                        self._cleanup_extracted_file(extracted_path)
                         continue
                     
                     # Process based on category
                     if is_source_category(classification.category):
+                        # Guard: skip source files exceeding max_source_size (same
+                        # guard as _process_large_blob, prevents data-dump memory
+                        # amplification during chunking/embedding).
+                        file_size = len(file_content)
+                        if file_size > max_src:
+                            logger.info(
+                                f"[{_short_path(full_source_path)}] Skipped — archive source "
+                                f"({file_size / 1024 / 1024:.1f} MB) exceeds "
+                                f"max_source_size ({max_src / 1024 / 1024:.0f} MB)"
+                            )
+                            self.progress.mark_skipped_binary()
+                            self._record_completed(full_source_path)
+                            self._cleanup_extracted_file(extracted_path)
+                            continue
+
                         self._process_source_file(
                             source_path=full_source_path,
                             content=file_content,
                             classification=classification,
-                            file_size=len(file_content),
+                            file_size=file_size,
                             dry_run=dry_run,
                         )
                     else:
@@ -999,6 +1265,9 @@ class GCSPipeline:
                         )
                     
                     extracted_count += 1
+
+                    # --- incremental cleanup: remove temp file immediately ---
+                    self._cleanup_extracted_file(extracted_path)
             
             self.progress.mark_archive_processed(extracted_count)
             logger.info(f"[{_short_path(archive_path)}] Archive complete: {extracted_count} files")
@@ -1009,6 +1278,15 @@ class GCSPipeline:
         finally:
             if temp_path and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _cleanup_extracted_file(path: Path) -> None:
+        """Remove an extracted temp file if it still exists."""
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
     
     def _process_source_file(
         self,
@@ -1230,7 +1508,19 @@ class GCSPipeline:
                     except Exception as e:
                         logger.warning(f"[{_short_path(source_path)}] Failed to cache text: {e}")
             except UnicodeDecodeError:
+                # Skip tiny images from docling — they waste memory and produce
+                # no useful text (icons, sprites, UI theme assets).
+                if self._is_small_image(content, source_path):
+                    logger.debug(
+                        f"[{_short_path(source_path)}] Skipped — image too small for docling OCR "
+                        f"({len(content)} bytes < {getattr(self.config, 'min_image_docling_size', 50*1024)} bytes)"
+                    )
+                    self.progress.mark_skipped_small_image()
+                    self._record_completed(source_path)
+                    return
+
                 # Binary document → extract via docling
+                rss_before_extract = _rss_mb()
                 doc = self._extract_docling_document(
                     source_path=source_path,
                     content=content,
@@ -1238,6 +1528,12 @@ class GCSPipeline:
                     cache_path=cache_path,
                     dry_run=dry_run,
                 )
+                rss_after_extract = _rss_mb()
+                if rss_after_extract - rss_before_extract > 500:
+                    logger.warning(
+                        f"[{_short_path(source_path)}] _extract_docling_document RSS: "
+                        f"{rss_before_extract}→{rss_after_extract} MB (+{rss_after_extract-rss_before_extract} MB)"
+                    )
                 if doc is None:
                     self.progress.mark_extraction_failed()
                     return
@@ -1246,11 +1542,18 @@ class GCSPipeline:
         source_url = resolve_source_url(source_path, content=markdown_content)
         
         # --- Step 3: Chunk ---
+        rss_pre_chunk = _rss_mb()
         if markdown_content is not None:
             content_hash = get_content_hash(markdown_content)
         elif doc is not None:
             # Use the markdown export for content hash
             markdown_content = doc.export_to_markdown()
+            rss_after_md = _rss_mb()
+            if rss_after_md - rss_pre_chunk > 200:
+                logger.warning(
+                    f"[{_short_path(source_path)}] export_to_markdown RSS: "
+                    f"{rss_pre_chunk}→{rss_after_md} MB (+{rss_after_md-rss_pre_chunk} MB)"
+                )
             content_hash = get_content_hash(markdown_content)
             # Also cache the markdown
             if not dry_run:
@@ -1282,10 +1585,17 @@ class GCSPipeline:
             self.progress.mark_extraction_failed()
             return
         
+        rss_post_chunk = _rss_mb()
         logger.debug(
             f"[{_short_path(source_path)}] Chunked into {len(chunks)} chunks "
             f"(chunker={chunks[0].metadata.get('chunker', '?') if chunks else '?'})"
         )
+        if rss_post_chunk - rss_pre_chunk > 200:
+            logger.warning(
+                f"[{_short_path(source_path)}] chunk RSS: "
+                f"{rss_pre_chunk}→{rss_post_chunk} MB (+{rss_post_chunk-rss_pre_chunk} MB, "
+                f"{len(chunks)} chunks)"
+            )
         
         # --- Step 4: Index ---
         try:
@@ -1347,6 +1657,17 @@ class GCSPipeline:
             text_content = content.decode('utf-8', errors='strict')
             markdown_content = text_content
         except UnicodeDecodeError:
+            # Skip tiny images from docling — they waste memory and produce
+            # no useful text (icons, sprites, UI theme assets).
+            if self._is_small_image(content, source_path):
+                logger.debug(
+                    f"[{_short_path(source_path)}] Skipped — image too small for docling OCR "
+                    f"({len(content)} bytes < {getattr(self.config, 'min_image_docling_size', 50*1024)} bytes)"
+                )
+                self.progress.mark_skipped_small_image()
+                self._record_completed(source_path)
+                return
+
             # Binary document (PDF, DOC, etc.) - extract DoclingDocument via docling
             try:
                 doc = self.extractor.extract_to_document(extracted_path)
@@ -1449,25 +1770,44 @@ class GCSPipeline:
         """
         temp_path = None
         try:
+            rss0 = _get_rss_gb()
             temp_path = self.gcs_client.download_blob_to_temp(blob)
             start_time = time.time()
             doc = self.extractor.extract_to_document(temp_path)
             elapsed = time.time() - start_time
-            logger.debug(f"[{_short_path(source_path)}] Docling extraction took {elapsed:.1f}s")
+            rss1 = _get_rss_gb()
             
             # Cache DoclingDocument JSON
             if not dry_run:
                 try:
-                    self.gcs_client.upload_docling_json(source_path, doc.model_dump_json())
+                    doc_json = doc.model_dump_json()
+                    json_mb = len(doc_json) / 1024 / 1024
+                    self.gcs_client.upload_docling_json(source_path, doc_json)
+                    del doc_json
+                    logger.info(
+                        f"[{_short_path(source_path)}] Uploaded DoclingDocument JSON "
+                        f"to {cache_path}.docling.json ({json_mb:.1f} MB)"
+                    )
                 except Exception as e:
+                    json_mb = 0
                     logger.warning(f"[{_short_path(source_path)}] Failed to cache DoclingDocument JSON: {e}")
                 
                 # Also cache markdown
                 try:
                     markdown = doc.export_to_markdown()
                     self.gcs_client.upload_markdown(cache_path, markdown)
+                    del markdown
                 except Exception as e:
                     logger.warning(f"[{_short_path(source_path)}] Failed to cache markdown: {e}")
+            else:
+                json_mb = 0
+
+            rss2 = _get_rss_gb()
+            logger.info(
+                f"[{_short_path(source_path)}] Docling pipeline trace: "
+                f"extract={elapsed:.1f}s, RSS before={rss0:.1f} after_extract={rss1:.1f} "
+                f"after_cache={rss2:.1f} GB"
+            )
             
             return doc
         except Exception as e:

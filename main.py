@@ -151,6 +151,25 @@ Environment Variables:
 
 def main() -> int:
     """Main entry point for the pipeline CLI."""
+    # Disable Transparent Huge Pages for this process.  With THP=always
+    # (the kernel default on GCE), glibc malloc arenas back every anonymous
+    # mapping with 2 MB huge pages.  These pages are never split back to
+    # 4 KB even after free(), causing RSS to balloon from ~2 GB to 70+ GB.
+    # PR_SET_THP_DISABLE tells the kernel to use 4 KB pages for this process
+    # and all its children (including docling subprocesses).
+    try:
+        import ctypes
+        PR_SET_THP_DISABLE = 41
+        libc = ctypes.CDLL(None)
+        libc.prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)
+    except Exception:
+        pass  # Not critical — just means THP stays enabled
+
+    # Also limit glibc malloc arenas to reduce fragmentation.
+    # Default is 8 * num_cores (= 128 on a 16-core machine).
+    import os
+    os.environ.setdefault("MALLOC_ARENA_MAX", "4")
+
     parser = create_parser()
     args = parser.parse_args()
     

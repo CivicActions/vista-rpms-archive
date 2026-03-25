@@ -213,6 +213,12 @@ def merge_config(file_config: dict, args: argparse.Namespace) -> Config:
         max_file_size=args.max_file_size if args.max_file_size is not None else extraction.get("max_file_size", 50 * 1024 * 1024),
         max_source_size=extraction.get("max_source_size", 10 * 1024 * 1024),
         max_concurrent_large=processing.get("max_concurrent_large", 1),
+        max_archive_members=extraction.get("max_archive_members", 2000),
+        docling_recycle_after=extraction.get("docling_recycle_after", 10),
+        max_concurrent_docling=extraction.get("max_concurrent_docling", 4),
+        min_image_docling_size=extraction.get("min_image_docling_size", 50 * 1024),
+        max_rss_gb=processing.get("max_rss_gb", 0),
+        docling_conversion_timeout=extraction.get("docling_conversion_timeout", 600),
         
         # Logging settings
         log_level=args.log_level if args.log_level is not None else logging_cfg.get("level", "INFO"),

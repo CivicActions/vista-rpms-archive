@@ -1,7 +1,19 @@
-"""GCS client wrapper with connection pooling for document extraction pipeline."""
+"""GCS client wrapper with thread-safe connection handling for document extraction pipeline.
+
+The google-cloud-storage library's ``storage.Client`` uses ``httplib2.Http``
+internally for HTTP transport, which is NOT thread-safe (see
+https://googleapis.github.io/google-api-python-client/docs/thread_safety.html).
+Sharing a single client across 16 worker threads causes memory corruption,
+leaked connections, and unbounded buffer growth (observed as 60+ GB RSS
+spikes with no corresponding Python objects).
+
+This module uses ``threading.local()`` to give each worker thread its own
+``storage.Client`` instance, ensuring no HTTP transport is shared.
+"""
 
 import logging
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -12,8 +24,12 @@ logger = logging.getLogger(__name__)
 
 
 class GCSClient:
-    """GCS client wrapper with connection pooling and retry logic."""
-    
+    """Thread-safe GCS client wrapper.
+
+    Each thread gets its own ``storage.Client`` via ``threading.local()``,
+    preventing the httplib2 thread-safety issues that cause memory leaks.
+    """
+
     def __init__(
         self,
         source_bucket: str,
@@ -21,25 +37,39 @@ class GCSClient:
         source_prefix: str = "",
         cache_prefix: str = "cache/",
     ):
-        """Initialize GCS client.
-        
-        Args:
-            source_bucket: Bucket containing source files
-            cache_bucket: Bucket for cached markdown output
-            source_prefix: Prefix path within source bucket
-            cache_prefix: Prefix path within cache bucket
-        """
-        # Create ONE client instance - handles connection pooling internally
-        self._client = storage.Client()
-        
         self._source_bucket_name = source_bucket
         self._cache_bucket_name = cache_bucket
         self._source_prefix = source_prefix.rstrip("/") + "/" if source_prefix else ""
         self._cache_prefix = cache_prefix.rstrip("/") + "/" if cache_prefix else ""
-        
-        # Get bucket references
-        self._source_bucket = self._client.bucket(source_bucket)
-        self._cache_bucket = self._client.bucket(cache_bucket)
+        self._local = threading.local()
+
+    def _get_client(self) -> storage.Client:
+        """Return a thread-local storage.Client instance."""
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = storage.Client()
+            self._local.client = client
+        return client
+
+    @property
+    def _source_bucket(self) -> storage.Bucket:
+        return self._get_client().bucket(self._source_bucket_name)
+
+    @property
+    def _cache_bucket(self) -> storage.Bucket:
+        return self._get_client().bucket(self._cache_bucket_name)
+
+    def _rebind_blob(self, blob: storage.Blob) -> storage.Blob:
+        """Re-bind a blob to this thread's storage.Client.
+
+        Blob objects returned by list_blobs() carry a reference to the
+        client that created them (the main thread's client).  Calling
+        methods like download_as_bytes() on those blobs from a worker
+        thread would use the main thread's HTTP session, which is not
+        thread-safe.  This method creates a new Blob bound to the
+        current thread's client.
+        """
+        return self._source_bucket.blob(blob.name)
     
     def cache_path_for_source(self, source_path: str) -> str:
         """Compute the cache path for a source file.
@@ -86,7 +116,7 @@ class GCSClient:
     def download_blob_content(self, blob: storage.Blob) -> bytes:
         """Download blob content as bytes without creating a temp file.
         
-        Useful for classification and direct text processing.
+        Re-binds the blob to the current thread's client for safety.
         
         Args:
             blob: GCS Blob object to download.
@@ -98,7 +128,8 @@ class GCSClient:
             GoogleCloudError: If download fails.
         """
         try:
-            content = blob.download_as_bytes()
+            local_blob = self._rebind_blob(blob)
+            content = local_blob.download_as_bytes()
             size_kb = len(content) / 1024
             if size_kb > 1024:
                 logger.info(f"Downloaded {blob.name} ({size_kb/1024:.1f} MB)")
@@ -139,7 +170,8 @@ class GCSClient:
         temp_file.close()
         
         try:
-            blob.download_to_filename(str(temp_path))
+            local_blob = self._rebind_blob(blob)
+            local_blob.download_to_filename(str(temp_path))
             size_kb = temp_path.stat().st_size / 1024
             if size_kb > 1024:
                 logger.info(f"Downloaded {blob.name} to temp ({size_kb/1024:.1f} MB)")

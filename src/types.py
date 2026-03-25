@@ -191,6 +191,12 @@ class Config:
     max_file_size: int = 50 * 1024 * 1024  # 50MB
     max_source_size: int = 10 * 1024 * 1024  # 10MB — skip source files larger than this (data dumps)
     max_concurrent_large: int = 1  # max concurrent large (>32MB) file processing
+    max_archive_members: int = 2000  # warn threshold for large archives (all files still processed)
+    docling_recycle_after: int = 10  # kept for config compat; unused with subprocess isolation
+    max_concurrent_docling: int = 4  # max simultaneous docling conversions (each in subprocess)
+    min_image_docling_size: int = 50 * 1024  # 50KB — skip images smaller than this from docling OCR (UI assets)
+    max_rss_gb: int = 0  # RSS circuit breaker in GB; 0 = disabled. Aborts archive processing if exceeded.
+    docling_conversion_timeout: int = 600  # seconds; kills subprocess if conversion takes longer
     
     # Logging settings
     log_level: str = "INFO"

@@ -446,20 +446,38 @@ class QdrantIndexer:
             except Exception as e:
                 logger.warning(f"Force-delete failed for '{source_path}': {e}")
 
-        # Upsert each chunk
-        indexed_count = 0
-        for chunk in chunks:
+        # Batch embed + batch upsert to minimise ONNX/HTTP overhead and
+        # native-memory fragmentation (critical for archives with thousands
+        # of small files like GOLD.zip).
+        try:
+            texts = [chunk.embedding_text for chunk in chunks]
+            import psutil, os
+            rss_pre = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+            vectors = self.embedder.embed_batch(texts)
+            rss_post = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+            if rss_post - rss_pre > 500:
+                logger.warning(
+                    f"[{source_path}] embed_batch RSS: {rss_pre}→{rss_post} MB "
+                    f"(+{rss_post-rss_pre} MB, {len(texts)} texts)"
+                )
+        except Exception as e:
+            error_msg = f"Batch embed failed: {e}"
+            logger.error(f"[{source_path}] {error_msg}")
+            return IndexingResult(
+                source_path=source_path,
+                collection=collection_name,
+                status="failed",
+                error=error_msg,
+            )
+
+        points = []
+        for chunk, vector in zip(chunks, vectors):
             try:
-                # Generate point ID: chunk 0 uses base ID, others use derived
                 if chunk.chunk_index == 0:
                     point_id = get_point_id(source_path)
                 else:
                     point_id = get_point_id(f"{source_path}#chunk{chunk.chunk_index}")
 
-                # Generate embedding from the chunk's embedding_text
-                vector = self.embedder.embed(chunk.embedding_text)
-
-                # Build payload per qdrant-payload.md contract
                 metadata = {
                     "source_path": chunk.source_path,
                     "source_url": chunk.source_url,
@@ -472,7 +490,6 @@ class QdrantIndexer:
                     "total_chunks": chunk.total_chunks,
                     "collection": collection_name,
                 }
-                # Merge chunker-specific metadata
                 metadata.update(chunk.metadata)
 
                 payload = {
@@ -481,20 +498,16 @@ class QdrantIndexer:
                     "content_hash": chunk.content_hash,
                 }
 
-                self.client.upsert(
-                    collection_name=collection_name,
-                    points=[
-                        models.PointStruct(
-                            id=point_id,
-                            vector={self.VECTOR_NAME: vector},
-                            payload=payload,
-                        )
-                    ],
+                points.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector={self.VECTOR_NAME: vector},
+                        payload=payload,
+                    )
                 )
-                indexed_count += 1
             except Exception as e:
                 error_msg = (
-                    f"Upsert failed for chunk {chunk.chunk_index}/{chunk.total_chunks}: {e}"
+                    f"Payload build failed for chunk {chunk.chunk_index}/{chunk.total_chunks}: {e}"
                 )
                 logger.error(f"[{source_path}] {error_msg}")
                 return IndexingResult(
@@ -503,6 +516,30 @@ class QdrantIndexer:
                     status="failed",
                     error=error_msg,
                 )
+
+        try:
+            rss_pre_upsert = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+            self.client.upsert(
+                collection_name=collection_name,
+                points=points,
+            )
+            rss_post_upsert = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+            if rss_post_upsert - rss_pre_upsert > 500:
+                logger.warning(
+                    f"[{source_path}] upsert RSS: {rss_pre_upsert}→{rss_post_upsert} MB "
+                    f"(+{rss_post_upsert-rss_pre_upsert} MB, {len(points)} points)"
+                )
+        except Exception as e:
+            error_msg = f"Batch upsert failed ({len(points)} points): {e}"
+            logger.error(f"[{source_path}] {error_msg}")
+            return IndexingResult(
+                source_path=source_path,
+                collection=collection_name,
+                status="failed",
+                error=error_msg,
+            )
+
+        indexed_count = len(points)
 
         logger.debug(
             f"Indexed '{source_path}' to '{collection_name}' ({indexed_count} chunks)"

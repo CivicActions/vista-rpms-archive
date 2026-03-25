@@ -22,12 +22,37 @@ workers = 8
 max_pending = 20
 # Per-file processing timeout in seconds
 timeout = 120
+# RSS circuit breaker (GB).  If process RSS exceeds this during archive
+# processing, the archive loop aborts to prevent an OOM kill.
+# Set to 0 to disable.  For a 128 GB machine, 100 is a good value.
+# max_rss_gb = 100
 
 [extraction]
 # Maximum pages to extract per document (0 = unlimited)
 max_pages = 500
 # Maximum file size to process in bytes (50MB default)
 max_file_size = 52428800
+# Maximum source-code file size (10MB default).  Files larger than this
+# are treated as data dumps and skipped to avoid memory amplification.
+# max_source_size = 10485760
+# Warning threshold for large archives. Logs a warning when exceeded but
+# all files are still processed. Memory is managed via periodic gc.collect().
+# max_archive_members = 2000
+
+# Recycle docling converter after N conversions per thread to release leaked
+# native memory. Lower values use less memory but spend more time reinitializing.
+# docling_recycle_after = 10
+
+# Max simultaneous docling conversions (PDFs, images, DOCX etc).
+# Each can use several GB of native memory. Converters are destroyed after
+# each use so only active conversions consume RAM.  Default 4.
+# max_concurrent_docling = 2
+
+# Minimum image file size (bytes) for docling OCR processing.
+# Images smaller than this are skipped (they're typically icons/sprites
+# with no useful text, and each docling conversion leaks ~50-100MB).
+# Set to 0 to send all images to docling regardless of size.
+# min_image_docling_size = 51200  # 50 KB
 
 [logging]
 # Log level: DEBUG, INFO, WARNING, ERROR

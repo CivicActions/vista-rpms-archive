@@ -123,7 +123,8 @@ DOCLING_MIME_TYPES = frozenset({
     # HTML/XHTML
     'text/html',
     'application/xhtml+xml',
-    # Images (Docling OCR)
+    # Images (Docling OCR) — pipeline applies a minimum-size threshold
+    # (min_image_docling_size) to avoid wasting memory on tiny UI assets.
     'image/png',
     'image/jpeg',
     'image/bmp',
@@ -146,6 +147,20 @@ DOCLING_MIME_TYPES = frozenset({
     'video/quicktime',     # MOV
     # Other
     'text/vtt',            # WebVTT
+})
+
+# Image MIME types (subset of DOCLING_MIME_TYPES).
+# Used by the pipeline to apply a minimum-size threshold — tiny images
+# (icons, sprites, UI theme assets) are skipped from docling OCR because
+# they produce no useful text and each conversion leaks ~50-100 MB of
+# native memory via libpdfium (see docling#2788).
+IMAGE_MIME_TYPES = frozenset({
+    'image/png',
+    'image/jpeg',
+    'image/bmp',
+    'image/tiff',
+    'image/gif',
+    'image/webp',
 })
 
 # Binary MIME types that should be skipped (not text-indexable)
@@ -649,3 +664,14 @@ def is_indexable_category(category: FileCategory) -> bool:
         True if should be indexed.
     """
     return category not in (FileCategory.BINARY, FileCategory.UNKNOWN)
+
+
+def detect_image_mime(content: bytes, filepath: str) -> Optional[str]:
+    """Return the image MIME type if the file is an image, else None.
+
+    Uses python-magic (if available) or falls back to extension matching.
+    """
+    mime = detect_mime_type(content, filepath)
+    if mime in IMAGE_MIME_TYPES:
+        return mime
+    return None
