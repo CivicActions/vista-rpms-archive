@@ -1,0 +1,222 @@
+# Thresher Production Configuration
+# Project: VistA / RPMS Document Extraction Pipeline
+# Bucket: gs://vista-rpms-archive/source
+#
+# Loading order: built-in defaults -> this file -> environment variables
+# Env overrides: QDRANT_URL, QDRANT_API_KEY, GCS_BUCKET
+
+# --- Source Provider ---
+source:
+  provider: gcs
+  gcs:
+    bucket: "vista-rpms-archive"
+    source_prefix: "source/"
+    expanded_prefix: "expanded/"
+    cache_prefix: "cache/"
+    queue_prefix: "queue/"
+
+# --- Destination Provider ---
+destination:
+  provider: qdrant
+  qdrant:
+    url: "http://qdrant.qdrant.svc.cluster.local:6333"  # In-cluster; overridden by env_secrets
+    api_key: ""                           # Injected via env_secrets -> K8s Secret
+    timeout: 300
+    batch_size: 1000
+    prefer_grpc: true
+    defer_indexing: true
+
+# --- File Type Groups ---
+# Same-name groups replace the built-in entirely; unmentioned built-ins
+# (general-source, data-files, images, plain-text, binary) are preserved.
+file_type_groups:
+  # Override office-documents: raise max_file_size to 200 MB for large
+  # VistA/RPMS PDFs with 100s of pages and complex tables.
+  office-documents:
+    extensions: [".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm", ".rtf"]
+    mime_types: ["application/pdf", "application/vnd.openxmlformats"]
+    extractor: docling
+    chunker:
+      strategy: docling-hybrid
+      chunk_size: 512
+    priority: 50
+    max_file_size: 209715200              # 200 MB
+
+  # MUMPS source routines (.m, .ro) — detected by label patterns
+  mumps-source:
+    extensions: [".m", ".ro"]
+    detectors: ["mumps-labels"]
+    extractor: raw-text
+    chunker:
+      strategy: mumps-label-boundary
+      chunk_size: 512
+    priority: 30
+    max_file_size: 10485760               # 10 MB
+
+  # MUMPS global exports (.zwr) — detected by caret density
+  mumps-globals:
+    extensions: [".zwr"]
+    detectors: ["caret-density"]
+    extractor: raw-text
+    chunker:
+      strategy: mumps-label-boundary
+      chunk_size: 512
+    priority: 30
+    max_file_size: 10485760               # 10 MB
+
+# --- Routing Rules ---
+# Evaluated in order, first-match-wins.
+# Within a rule: criteria types are ANDed; values within each are ORed.
+# Path patterns use regex (triggered by leading ^) with (?i) for
+# case-insensitive matching.
+routing:
+  default_collection: "vista"
+  rules:
+    # 0. Exclude Araxis Merge diff report files (71% of 5.8M files are junk)
+    - name: skip-araxis-reports
+      skip: true
+      path:
+        - "FolderComparisonReport_files/"
+        - "Public_Report_files/"
+        - "Public_Araxis_Report_files/"
+        - "Public_Change_Report_files/"
+
+    # 1. Code files under IHS/RPMS paths → rpms-source
+    - name: rpms-source-code
+      file_group: ["mumps-source", "mumps-globals", "general-source"]
+      path: ["^(?i).*ihs\\.gov", "^(?i).*rpms"]
+      collection: rpms-source
+      embedding: code
+
+    # 2. Remaining files under IHS/RPMS paths → rpms (docs, data, etc.)
+    - name: rpms-docs
+      path: ["^(?i).*ihs\\.gov", "^(?i).*rpms"]
+      collection: rpms
+
+    # 3. All other code files → vista-source
+    - name: vista-source-code
+      file_group: ["mumps-source", "mumps-globals", "general-source"]
+      collection: vista-source
+      embedding: code
+
+    # 4. Everything else falls through to default_collection: vista
+
+# --- URL Resolvers ---
+# Chain tried in order; first non-None result wins.
+url_resolvers:
+  - type: httrack
+  - type: pattern
+    match: "^WorldVistA/([^/]+)/(.+)$"
+    template: "https://github.com/WorldVistA/{1}/blob/HEAD/{2}"
+    strip_prefix: "source/"
+  - type: pattern
+    match: "^WorldVistA/([^/]+)$"
+    template: "https://github.com/WorldVistA/{1}"
+    strip_prefix: "source/"
+  - type: domain-first
+    strip_prefix: "source/"
+
+# --- Processing Settings ---
+# High limits for large, high-value VistA/RPMS documents (100s of pages,
+# complex tables, large archives).
+processing:
+  max_pages: 20000                        # Default 500 — raised for massive PDFs
+  docling_timeout: 4800
+  per_file_timeout: 5000
+  image_min_size: 51200                   # 50 KB — skip tiny images from OCR
+  retry_max: 3
+  memory_threshold_mb: 62000
+  malloc_arena_max: 2
+  embed_batch_size: 256                   # Embed in batches of 256 chunks to limit peak memory
+  archive_depth: 2
+  summary_interval: 100
+  archive_exclude_extensions:             # Zip-based artifacts to never expand
+    - ".jar"
+    - ".war"
+    - ".whl"
+    - ".egg"
+    - ".apk"
+    - ".ipa"
+  max_expansion_parallelism: 100            # Concurrent expansion jobs (K8s) or threads
+  upload_batch_size: 50                   # Concurrent file uploads per expansion job
+  expansion_timeout: 28800                # Max seconds for all expansion jobs (8 hours)
+  ocr_enabled: true                       # Enable OCR for scanned PDFs and images
+  ocr_lang:                               # Tesseract language codes
+    - eng
+
+# --- Queue Settings ---
+queue:
+  batch_size: 250
+  lease_timeout: 7200                    # 2 hours — batches take ~125 min at 30s/file × 250
+  max_reclaims: 3                         # Checkpointed progress survives reclaim; 3 retries before retry/
+
+# --- Embedding Settings ---
+# Multi-model: text-optimized for docs, code-aware for source collections
+embedding:
+  default: docs
+  models:
+    docs:
+      model: "nomic-ai/nomic-embed-text-v1.5"
+      vector_size: 768
+      vector_name: "nomic-v1.5"
+      max_tokens: 512
+      index_prefix: "search_document: "
+      query_prefix: "search_query: "
+    code:
+      model: "jinaai/jina-embeddings-v2-base-code"
+      vector_size: 768
+      vector_name: "jina-code-v2"
+      max_tokens: 512
+
+# --- Kubernetes Settings ---
+# Resource requests tuned from observed usage (P90 CPU: 325m, P75 mem: 2.6Gi).
+# Low requests let NAP pack pods densely; high limits allow docling bursts.
+# OOM from large PDFs is caught by reclaim-to-retry mechanism.
+
+# --- MCP Server Settings ---
+# Customizes the find tool description for agents connecting via the MCP server.
+mcp:
+  tool_find_description: >-
+    Semantic search over VistA and RPMS documents and source code.
+    Queries should be natural language descriptions of concepts or topics,
+    not keywords — e.g. 'how patient allergies are stored and validated'
+    rather than 'allergy API'.
+    Collections: 'vista' (VistA documentation — manuals, patches, technical guides),
+    'vista-source' (VistA MUMPS/M routines and source code),
+    'rpms' (RPMS/IHS documentation),
+    'rpms-source' (RPMS MUMPS/M routines and source code).
+    Use source_path to filter by file path when you know the package or routine name.
+    Results are document chunks with source file paths — use multiple queries
+    to triangulate across docs and source code.
+
+kubernetes:
+  namespace: "vista-rpms-archive"
+  service_account: ""
+  image: "ghcr.io/civicactions/thresher:latest"
+  image_pull_policy: "Always"
+  config_configmap: "thresher-config"     # Mount prod-config.yaml into runner/expander Jobs
+  credentials_secret: "gcs-credentials"   # Mount GCS service account key into Jobs
+  env_secrets:
+    QDRANT_URL:
+      secret: qdrant-credentials
+      key: url
+    QDRANT_API_KEY:
+      secret: qdrant-credentials
+      key: api-key
+  runner_resources:
+    requests:
+      cpu: "500m"                         # P90 actual: 325m
+      memory: "30Gi"                       # Avg actual: 8Gi; low req lets NAP pack densely
+    limits:
+      cpu: "4"                            # Max observed: 1.9 cores
+      memory: "64Gi"                      # Large docling/embedding can spike
+  expander_resources:
+    requests:
+      cpu: "250m"                         # Expanders are I/O-bound, not CPU-bound
+      memory: "512Mi"                     # Most archives decompress under 512 Mi
+    limits:
+      cpu: "1"                            # Burst for 7z fallback decompression
+      memory: "8Gi"                       # Large FOIA zips can spike to ~5 Gi
+  max_parallelism: 1200
+  backoff_limit: 20                        # Allow many restarts (OOM + graceful exit cycle)
+  ttl_seconds_after_finished: 7200         # Clean up finished pods after 2 hours
