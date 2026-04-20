@@ -34,7 +34,9 @@ The archive is built from several public sources related to VistA and RPMS. All 
 
 The archive is searchable via the [`mcp-server-qdrant`](https://github.com/CivicActions/thresher/tree/main/mcp-server) MCP server, which exposes a single `qdrant-find` tool for semantic search across the indexed collections.
 
-Remember to set your API key in the configuration!
+All configurations below run the server with [`uvx`](https://docs.astral.sh/uv/guides/tools/), which fetches and runs the server directly from the thresher repo on first use. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first if you don't have it.
+
+> **Note:** Remember to set your API key in the configuration!
 
 ### Claude Code
 
@@ -46,7 +48,7 @@ claude mcp add vista-rpms \
   -e QDRANT_API_KEY='<your-api-key>' \
   -e COLLECTIONS='[{"name": "rpms-source", "model": "jinaai/jina-embeddings-v2-base-code", "vector_name": "jina-code-v2", "vector_size": 768, "index_prefix": "", "query_prefix": ""}, {"name": "rpms", "model": "nomic-ai/nomic-embed-text-v1.5", "vector_name": "nomic-v1.5", "vector_size": 768, "index_prefix": "search_document: ", "query_prefix": "search_query: "}, {"name": "vista-source", "model": "jinaai/jina-embeddings-v2-base-code", "vector_name": "jina-code-v2", "vector_size": 768, "index_prefix": "", "query_prefix": ""}, {"name": "vista", "model": "nomic-ai/nomic-embed-text-v1.5", "vector_name": "nomic-v1.5", "vector_size": 768, "index_prefix": "search_document: ", "query_prefix": "search_query: "}]' \
   -e TOOL_FIND_DESCRIPTION='Semantic search over VistA and RPMS documents and source code. Queries should be natural language descriptions of concepts or topics, not keywords. Collections: vista (VistA documentation), vista-source (VistA MUMPS/M source code), rpms (RPMS/IHS documentation), rpms-source (RPMS MUMPS/M source code). Use source_path to filter by file path when you know the package or routine name.' \
-  -- mcp-server-qdrant
+  -- uvx --from 'git+https://github.com/CivicActions/thresher@main#subdirectory=mcp-server' mcp-server-qdrant
 ```
 
 ### Claude Desktop
@@ -57,8 +59,12 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "vista-rpms": {
-      "command": "mcp-server-qdrant",
-      "args": [],
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/CivicActions/thresher@main#subdirectory=mcp-server",
+        "mcp-server-qdrant"
+      ],
       "env": {
         "QDRANT_URL": "https://qdrant.cicd.civicactions.net:443",
         "DEFAULT_COLLECTION": "vista",
@@ -81,8 +87,12 @@ Add to `.vscode/mcp.json` in your workspace or View -> Command Palette -> MCP: O
   "servers": {
     "vistaRpms": {
       "type": "stdio",
-      "command": "mcp-server-qdrant",
-      "args": [],
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/CivicActions/thresher@main#subdirectory=mcp-server",
+        "mcp-server-qdrant"
+      ],
       "env": {
         "QDRANT_URL": "https://qdrant.cicd.civicactions.net:443",
         "DEFAULT_COLLECTION": "vista",
@@ -112,8 +122,12 @@ Add to your Cursor MCP configuration:
 {
   "mcpServers": {
     "vista-rpms": {
-      "command": "mcp-server-qdrant",
-      "args": [],
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/CivicActions/thresher@main#subdirectory=mcp-server",
+        "mcp-server-qdrant"
+      ],
       "env": {
         "QDRANT_URL": "https://qdrant.cicd.civicactions.net:443",
         "DEFAULT_COLLECTION": "vista",
@@ -136,6 +150,53 @@ You may want to adjust these environment variables in your configuration:
 - **`TOOL_FIND_DESCRIPTION`** — The tool description seen by the LLM. Adjust this to change when and how the model decides to search.
 - **`QDRANT_SEARCH_LIMIT`** — Default number of results returned per query (default: 10).
 
+## Programmatic access via the Qdrant API
+
+You can also query the index directly over HTTP using the [Qdrant REST API](https://api.qdrant.tech/) — useful for testing your API key, or for building your own tools and scripts on top of the index.
+
+**Test your API key:**
+
+```bash
+curl -H "api-key: <your-api-key>" \
+  https://qdrant.cicd.civicactions.net/collections
+```
+
+This should return JSON listing the four collections (`vista`, `vista-source`, `rpms`, `rpms-source`).
+
+**Run a semantic search:**
+
+The collections do not run embedding inference server-side, so you need to compute the query embedding yourself and POST it. Use the matching model and vector name for the collection you are searching:
+
+| Collection | Model | Vector name | Query prefix |
+|---|---|---|---|
+| `vista`, `rpms` | `nomic-ai/nomic-embed-text-v1.5` | `nomic-v1.5` | `search_query: ` |
+| `vista-source`, `rpms-source` | `jinaai/jina-embeddings-v2-base-code` | `jina-code-v2` | (none) |
+
+A minimal end-to-end Python example using [fastembed](https://github.com/qdrant/fastembed) (the same library the MCP server uses):
+
+```python
+import os, requests
+from fastembed import TextEmbedding
+
+model = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+vector = next(model.embed(["search_query: how are patient allergies stored"]))
+
+r = requests.post(
+    "https://qdrant.cicd.civicactions.net/collections/vista/points/query",
+    headers={"api-key": os.environ["QDRANT_API_KEY"]},
+    json={"query": vector.tolist(), "using": "nomic-v1.5",
+          "limit": 5, "with_payload": True},
+)
+for hit in r.json()["result"]["points"]:
+    print(hit["score"], hit["payload"]["source"])
+```
+
+To narrow results to a specific source file or directory, add a payload filter:
+
+```json
+"filter": {"must": [{"key": "source", "match": {"text": "GMRA"}}]}
+```
+
 ## Indexing details
 
 Documents are indexed into [Qdrant](https://qdrant.tech/), an open-source vector search engine, using [Thresher](https://github.com/CivicActions/thresher), a cloud-native pipeline that converts documents into chunked markdown and indexes them as vector embeddings.
@@ -150,6 +211,27 @@ Documents are indexed into [Qdrant](https://qdrant.tech/), an open-source vector
 | `rpms-source` | IHS RPMS source code | `jinaai/jina-embeddings-v2-base-code` |
 
 The full pipeline configuration — including file type groups, routing rules, chunking strategies, and processing settings — is in [prod-config.yaml](prod-config.yaml).
+
+**File types and chunking:**
+
+Files are classified into groups based on extension, MIME type, and (for ambiguous `.m`, `.ro`, and `.zwr` files) content detectors that look for MUMPS label patterns and caret density. Each group is processed by a specific extractor and chunker. All chunks target ~512 tokens.
+
+| File group | Extensions | Extractor | Chunker | Notes |
+|---|---|---|---|---|
+| `office-documents` | `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.html`, `.htm`, `.rtf` | [Docling](https://github.com/docling-project/docling) (with OCR for scanned PDFs) | `docling-hybrid` (structure-aware: respects headings, tables, and document layout) | Max 200 MB to accommodate large VistA/RPMS technical manuals |
+| `audio-video` | `.wav`, `.mp3`, `.m4a`, `.aac`, `.ogg`, `.flac`, `.mp4`, `.avi`, `.mov` | Docling ASR pipeline using [Whisper Turbo](https://github.com/openai/whisper) for speech-to-text | `chonkie-recursive` | No file size cap; transcribes meeting recordings, demo videos, and audio prompts |
+| `mumps-source` | `.m`, `.ro` | raw text | `mumps-label-boundary` (splits on MUMPS routine labels to keep each callable entry point together) | Detected by label-pattern heuristic; 10 MB cap |
+| `mumps-globals` | `.zwr` | raw text | `mumps-label-boundary` | Detected by caret-density heuristic; 10 MB cap |
+| `general-source` | `.py`, `.js`, `.ts`, `.java`, `.c`, `.cpp`, `.go`, `.rs`, `.rb`, `.php`, `.sh`, `.sql`, etc. | raw text | `chonkie-code` (language-aware AST/syntax-based splitting via [Chonkie](https://github.com/chonkie-inc/chonkie)) | 10 MB cap |
+| `plain-text` | `.txt`, `.md`, `.rst`, `.log`, `.readme` | raw text | `chonkie-recursive` (markdown-aware recursive splitting) | |
+| `data-files` | `.json`, `.xml`, `.csv`, `.tsv`, `.yaml`, `.toml`, `.ini`, `.cfg` | raw text | `chonkie-recursive` | |
+| `images` | `.png`, `.jpg`, `.gif`, `.bmp`, `.tiff`, `.svg` | Docling (OCR) | `docling-hybrid` | Images under 50 KB are skipped to avoid OCR noise |
+
+Archives (`.zip`, `.tar`, `.tar.gz`, `.7z`, etc.) are recursively expanded up to two levels deep before classification. Java/Python packaging archives (`.jar`, `.war`, `.whl`, `.egg`, `.apk`, `.ipa`) are not expanded.
+
+Routing into the four collections is determined by file group and source path: source-code groups under IHS/RPMS paths go to `rpms-source`; other IHS/RPMS files go to `rpms`; other source-code goes to `vista-source`; everything else goes to `vista`. Diff-report directories from Araxis Merge (which made up ~71% of files in expanded archives) are skipped entirely.
+
+Not every file made it into the index — some were skipped due to per-file timeouts, OCR/Docling memory exhaustion, or repeated extraction failures. The raw files remain available in the GCS archive.
 
 ## Statistics
 
