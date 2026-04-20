@@ -279,4 +279,5 @@ All archival content lives in the GCS bucket `gs://vista-rpms-archive` with the 
 | `expanded/` | Contents extracted from archives (ZIPs, tarballs, etc.) found in `source/`, expanded up to 2 levels deep. Each archive has an `.expansion-record.json` for idempotency. |
 | `cache/` | Intermediate extraction cache (e.g. Docling document conversions) used to avoid re-processing on subsequent runs. |
 | `queue/` | Batch processing state (if running) for the Thresher runner pipeline, split into `pending/`, `claimed/`, and `completed/` sub-prefixes. |
+| `snapshots/` | Full Qdrant snapshots for each collection (see above), usable for restoring the index without re-running the pipeline. |
 
